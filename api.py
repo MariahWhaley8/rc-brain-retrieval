@@ -12,14 +12,15 @@ Endpoints:
     POST /retrieve  — semantic search + rerank; returns top passages
 
 Environment variables (set in Railway):
-    DATABASE_URL       - PostgreSQL connection string (from Railway)
-    VOYAGE_API_KEY     - Voyage AI API key
-    VOYAGE_EMBED_MODEL - Model used at index time (default: voyage-large-2)
-                         MUST match the model used by the indexer.
+    DATABASE_URL        - PostgreSQL connection string (from Railway)
+    VOYAGE_API_KEY      - Voyage AI API key
+    VOYAGE_EMBED_MODEL  - Model used at index time (default: voyage-large-2)
+                          MUST match the model used by the indexer.
     VOYAGE_RERANK_MODEL - Reranker model (default: rerank-2)
-    TOP_K              - Candidates to fetch from Postgres before reranking (default: 20)
-    RERANK_TOP_N       - Final passages returned after reranking (default: 5)
-    PORT               - Port to listen on (Railway sets this automatically)
+    TOP_K               - Candidates to fetch from Postgres before reranking (default: 20)
+    RERANK_TOP_N        - Final passages returned after reranking (default: 5)
+    PORT                - Port to listen on (Railway sets this automatically)
+    RETRIEVAL_API_KEY   - Secret key callers must send as X-API-Key header
 """
 
 import os
@@ -29,7 +30,8 @@ import psycopg2
 import voyageai
 from contextlib import contextmanager
 from typing import Optional
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Security, Depends
+from fastapi.security.api_key import APIKeyHeader
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from dotenv import load_dotenv
@@ -44,15 +46,25 @@ logging.basicConfig(
 )
 log = logging.getLogger(__name__)
 
-# ── Config ──────────────────────────────────────────────────────────────────
+# ── Config ───────────────────────────────────────────────────────────────────
 VOYAGE_API_KEY      = os.environ["VOYAGE_API_KEY"]
 DATABASE_URL        = os.environ["DATABASE_URL"]
 VOYAGE_EMBED_MODEL  = os.environ.get("VOYAGE_EMBED_MODEL",  "voyage-large-2")
 VOYAGE_RERANK_MODEL = os.environ.get("VOYAGE_RERANK_MODEL", "rerank-2")
 TOP_K               = int(os.environ.get("TOP_K",         "20"))
 RERANK_TOP_N        = int(os.environ.get("RERANK_TOP_N",  "5"))
+RETRIEVAL_API_KEY   = os.environ.get("RETRIEVAL_API_KEY", "")
 
 vo = voyageai.Client(api_key=VOYAGE_API_KEY)
+
+# ── Auth ──────────────────────────────────────────────────────────────────────
+api_key_header = APIKeyHeader(name="X-API-Key", auto_error=False)
+
+def require_api_key(key: str = Security(api_key_header)):
+    if not RETRIEVAL_API_KEY:
+        return   # key not configured — open access (dev mode)
+    if key != RETRIEVAL_API_KEY:
+        raise HTTPException(status_code=401, detail="Invalid or missing API key")
 
 # ── App ───────────────────────────────────────────────────────────────────────
 app = FastAPI(
@@ -63,7 +75,7 @@ app = FastAPI(
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],          # Base44 calls from its own backend
+    allow_origins=["*"],
     allow_methods=["GET", "POST"],
     allow_headers=["*"],
 )
@@ -129,7 +141,7 @@ def health():
         raise HTTPException(status_code=500, detail=str(exc))
 
 
-@app.post("/retrieve", response_model=RetrievalResponse)
+@app.post("/retrieve", response_model=RetrievalResponse, dependencies=[Depends(require_api_key)])
 def retrieve(req: RetrievalRequest):
     """
     Semantic search + rerank.
@@ -140,7 +152,7 @@ def retrieve(req: RetrievalRequest):
     4. Return the top RERANK_TOP_N passages with metadata.
     """
     final_n = req.top_k or RERANK_TOP_N
-    candidates_n = max(final_n * 4, TOP_K)   # always fetch ≥4× what we'll return
+    candidates_n = max(final_n * 4, TOP_K)   # always fetch >=4x what we'll return
 
     # ── Step 1: embed the question ──────────────────────────────────────────
     try:
@@ -155,9 +167,8 @@ def retrieve(req: RetrievalRequest):
         raise HTTPException(status_code=502, detail=f"Embedding failed: {exc}")
 
     # ── Step 2: vector search in Postgres ──────────────────────────────────
-    # Build optional WHERE clause for category / source filters
     where_parts  = []
-    filter_params: list = []
+    filter_params = []
 
     if req.category:
         where_parts.append("category = %s")
@@ -184,7 +195,6 @@ def retrieve(req: RetrievalRequest):
         ORDER BY embedding <=> %s::vector
         LIMIT %s
     """
-    # params: [vector_for_ORDER, ...filter_params, vector_for_ORDER, limit]
     params = [json.dumps(q_vector)] + filter_params + [json.dumps(q_vector), candidates_n]
 
     try:
@@ -210,10 +220,9 @@ def retrieve(req: RetrievalRequest):
             model=VOYAGE_RERANK_MODEL,
             top_k=final_n,
         )
-        top_results = rerank_result.results   # sorted best-first
+        top_results = rerank_result.results
     except Exception as exc:
         log.warning(f"Reranking failed ({exc}), falling back to similarity order")
-        # Fallback: just take the top final_n by vector similarity
         top_results = [
             type("R", (), {"index": i, "relevance_score": rows[i][8]})()
             for i in range(min(final_n, len(rows)))
