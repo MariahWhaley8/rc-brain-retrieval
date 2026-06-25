@@ -38,7 +38,7 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
-# ── Logging ──────────────────────────────────────────────────────────────────
+# ── Logging ────────────────────────────────────────────
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s  %(levelname)-8s  %(message)s",
@@ -46,7 +46,7 @@ logging.basicConfig(
 )
 log = logging.getLogger(__name__)
 
-# ── Config ───────────────────────────────────────────────────────────────────
+# ── Config ───────────────────────────────────────────────
 VOYAGE_API_KEY      = os.environ["VOYAGE_API_KEY"]
 DATABASE_URL        = os.environ["DATABASE_URL"]
 VOYAGE_EMBED_MODEL  = os.environ.get("VOYAGE_EMBED_MODEL",  "voyage-large-2")
@@ -57,7 +57,7 @@ RETRIEVAL_API_KEY   = os.environ.get("RETRIEVAL_API_KEY", "")
 
 vo = voyageai.Client(api_key=VOYAGE_API_KEY)
 
-# ── Auth ──────────────────────────────────────────────────────────────────────
+# ── Auth ──────────────────────────────────────────────────────────
 api_key_header = APIKeyHeader(name="X-API-Key", auto_error=False)
 
 def require_api_key(key: str = Security(api_key_header)):
@@ -66,7 +66,7 @@ def require_api_key(key: str = Security(api_key_header)):
     if key != RETRIEVAL_API_KEY:
         raise HTTPException(status_code=401, detail="Invalid or missing API key")
 
-# ── App ───────────────────────────────────────────────────────────────────────
+# ── App ───────────────────────────────────────────────────────────────
 app = FastAPI(
     title="RC Brain Retrieval API",
     description="Semantic search over RC Brain's KnowledgeDocument library.",
@@ -81,7 +81,7 @@ app.add_middleware(
 )
 
 
-# ── DB connection ─────────────────────────────────────────────────────────────
+# ── DB connection ─────────────────────────────────────────────────────
 
 @contextmanager
 def get_db():
@@ -92,13 +92,13 @@ def get_db():
         conn.close()
 
 
-# ── Request / Response models ─────────────────────────────────────────────────
+# ── Request / Response models ───────────────────────────────────────────────────
 
 class RetrievalRequest(BaseModel):
     question:   str
-    top_k:      Optional[int] = None   # overrides RERANK_TOP_N for this call
-    category:   Optional[str] = None   # filter to a specific category
-    source:     Optional[str] = None   # filter by source type (YouTube, Internal, …)
+    top_k:      Optional[int] = None
+    category:   Optional[str] = None
+    source:     Optional[str] = None
 
 
 class Passage(BaseModel):
@@ -108,6 +108,7 @@ class Passage(BaseModel):
     topic:            Optional[str]
     source:           Optional[str]
     source_url:       Optional[str]
+    source_date:      Optional[str]
     is_authoritative: bool
     chunk_text:       str
     relevance_score:  float
@@ -118,7 +119,7 @@ class RetrievalResponse(BaseModel):
     passages: list[Passage]
 
 
-# ── Endpoints ─────────────────────────────────────────────────────────────────
+# ── Endpoints ───────────────────────────────────────────────────────────────
 
 @app.get("/health")
 def health():
@@ -152,9 +153,8 @@ def retrieve(req: RetrievalRequest):
     4. Return the top RERANK_TOP_N passages with metadata.
     """
     final_n = req.top_k or RERANK_TOP_N
-    candidates_n = max(final_n * 4, TOP_K)   # always fetch >=4x what we'll return
+    candidates_n = max(final_n * 4, TOP_K)
 
-    # ── Step 1: embed the question ──────────────────────────────────────────
     try:
         embed_result = vo.embed(
             [req.question],
@@ -166,9 +166,8 @@ def retrieve(req: RetrievalRequest):
         log.error(f"Voyage embed failed: {exc}")
         raise HTTPException(status_code=502, detail=f"Embedding failed: {exc}")
 
-    # ── Step 2: vector search in Postgres ──────────────────────────────────
     where_parts  = []
-    filter_params = []
+    filter_params: list = []
 
     if req.category:
         where_parts.append("category = %s")
@@ -187,6 +186,7 @@ def retrieve(req: RetrievalRequest):
             topic,
             source,
             source_url,
+            source_date,
             is_authoritative,
             chunk_text,
             1 - (embedding <=> %s::vector) AS similarity
@@ -210,8 +210,7 @@ def retrieve(req: RetrievalRequest):
         log.info(f"No results for: {req.question!r}")
         return RetrievalResponse(question=req.question, passages=[])
 
-    # ── Step 3: rerank ──────────────────────────────────────────────────────
-    chunk_texts = [row[7] for row in rows]
+    chunk_texts = [row[8] for row in rows]
 
     try:
         rerank_result = vo.rerank(
@@ -224,11 +223,10 @@ def retrieve(req: RetrievalRequest):
     except Exception as exc:
         log.warning(f"Reranking failed ({exc}), falling back to similarity order")
         top_results = [
-            type("R", (), {"index": i, "relevance_score": rows[i][8]})()
+            type("R", (), {"index": i, "relevance_score": rows[i][9]})()
             for i in range(min(final_n, len(rows)))
         ]
 
-    # ── Step 4: build response ──────────────────────────────────────────────
     passages = []
     for result in top_results:
         row = rows[result.index]
@@ -240,8 +238,9 @@ def retrieve(req: RetrievalRequest):
                 topic=            row[3],
                 source=           row[4],
                 source_url=       row[5],
-                is_authoritative= bool(row[6]),
-                chunk_text=       row[7],
+                source_date=      row[6],
+                is_authoritative= bool(row[7]),
+                chunk_text=       row[8],
                 relevance_score=  float(result.relevance_score),
             )
         )
@@ -251,8 +250,6 @@ def retrieve(req: RetrievalRequest):
     )
     return RetrievalResponse(question=req.question, passages=passages)
 
-
-# ── Dev server ────────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
     import uvicorn
