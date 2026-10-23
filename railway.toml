@@ -1,3 +1,8 @@
+# Indexing runs inside this web process (POST /reindex and the Monday
+# 19:00 America/Chicago scheduler). Do not change startCommand to
+# `python indexer.py`: this healthcheck would fail and the deploy would
+# be marked failed, which is what happened to the standalone indexer.
+
 [build]
 builder = "DOCKERFILE"
 dockerfilePath = "Dockerfile"
