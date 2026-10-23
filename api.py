@@ -8,8 +8,10 @@ Base44 calls POST /retrieve with the user's question.
 The API returns the top passages from the knowledge store, ready to pass to Claude.
 
 Endpoints:
-    GET  /health    — liveness check; returns chunk count
-    POST /retrieve  — semantic search + rerank; returns top passages
+    GET  /health           — liveness check; returns chunk count
+    POST /retrieve         — semantic search + rerank; returns top passages
+    POST /reindex          — start an incremental reindex in the background
+    GET  /reindex/status   — progress of the latest reindex
 
 Environment variables (set in Railway):
     DATABASE_URL        - PostgreSQL connection string (from Railway)
@@ -21,16 +23,28 @@ Environment variables (set in Railway):
     RERANK_TOP_N        - Final passages returned after reranking (default: 5)
     PORT                - Port to listen on (Railway sets this automatically)
     RETRIEVAL_API_KEY   - Secret key callers must send as X-API-Key header
+    BASE44_API_KEY      - Base44 personal access token used by the indexer
+    BASE44_APP_ID       - Base44 app id (indexer default is the RC Brain app)
+    REINDEX_SCHEDULER   - "false" disables the Monday 19:00 America/Chicago job
+    REINDEX_ON_STARTUP  - "false" disables the catch-up reindex when the last
+                          successful run is missing or older than 8 days
 """
 
 import os
 import json
 import logging
+import threading
 import psycopg2
 import voyageai
-from contextlib import contextmanager
-from typing import Optional
-from fastapi import FastAPI, HTTPException, Security, Depends
+from contextlib import asynccontextmanager, contextmanager
+from datetime import datetime, timezone
+from typing import Any, Optional
+from zoneinfo import ZoneInfo
+
+from apscheduler.schedulers.background import BackgroundScheduler
+from apscheduler.triggers.cron import CronTrigger
+from fastapi import Body, FastAPI, HTTPException, Security, Depends
+from fastapi.responses import JSONResponse
 from fastapi.security.api_key import APIKeyHeader
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
@@ -46,6 +60,13 @@ logging.basicConfig(
 )
 log = logging.getLogger(__name__)
 
+from indexer import (  # noqa: E402
+    default_connect,
+    index_documents,
+    is_reindex_due,
+    read_reindex_state,
+)
+
 # ── Config ───────────────────────────────────────────────
 VOYAGE_API_KEY      = os.environ["VOYAGE_API_KEY"]
 DATABASE_URL        = os.environ["DATABASE_URL"]
@@ -56,6 +77,186 @@ RERANK_TOP_N        = int(os.environ.get("RERANK_TOP_N",  "5"))
 RETRIEVAL_API_KEY   = os.environ.get("RETRIEVAL_API_KEY", "")
 
 vo = voyageai.Client(api_key=VOYAGE_API_KEY)
+
+REINDEX_SCHEDULE_DESCRIPTION = "Mondays at 19:00 America/Chicago"
+# A few hours, so a deploy or a busy event loop around 19:00 still runs the job.
+REINDEX_MISFIRE_GRACE_SECONDS = 6 * 60 * 60
+
+_state_lock = threading.Lock()
+_reindex_state = {
+    "state": "idle",
+    "force": False,
+    "trigger": None,
+    "started_at": None,
+    "finished_at": None,
+    "stats": None,
+    "error": None,
+}
+
+
+def _env_flag(name: str, default: bool) -> bool:
+    raw = os.environ.get(name)
+    if raw is None:
+        return default
+    return raw.strip().lower() not in {"0", "false", "no", "off"}
+
+
+def _scheduler_enabled() -> bool:
+    return _env_flag("REINDEX_SCHEDULER", True)
+
+
+def _startup_reindex_enabled() -> bool:
+    return _env_flag("REINDEX_ON_STARTUP", True)
+
+
+def _now() -> str:
+    return datetime.now(timezone.utc).isoformat()
+
+
+def _chicago() -> ZoneInfo:
+    return ZoneInfo("America/Chicago")
+
+
+def weekly_reindex_trigger() -> CronTrigger:
+    return CronTrigger(day_of_week="mon", hour=19, minute=0, timezone=_chicago())
+
+
+def _snapshot() -> dict:
+    with _state_lock:
+        body = dict(_reindex_state)
+        if body.get("stats") is not None:
+            body["stats"] = dict(body["stats"])
+    body["schedule"] = REINDEX_SCHEDULE_DESCRIPTION
+    body["scheduler_enabled"] = _scheduler_enabled()
+    return body
+
+
+def reindex_status() -> dict:
+    body = _snapshot()
+    if body["state"] == "idle":
+        try:
+            finished, status = read_reindex_state(default_connect)
+        except Exception as exc:
+            log.warning("Could not read indexer state: %s", exc)
+            finished, status = None, None
+        body["last_finished_at"] = finished.isoformat() if finished else None
+        body["last_status"] = status
+    return body
+
+
+def start_reindex(force: bool, trigger: str) -> tuple[int, dict]:
+    with _state_lock:
+        if _reindex_state["state"] == "running":
+            body = dict(_reindex_state)
+            body["status"] = "already_running"
+            body["schedule"] = REINDEX_SCHEDULE_DESCRIPTION
+            return 409, body
+        _reindex_state.update(
+            {
+                "state": "running",
+                "force": force,
+                "trigger": trigger,
+                "started_at": _now(),
+                "finished_at": None,
+                "stats": None,
+                "error": None,
+            }
+        )
+
+    def run() -> None:
+        try:
+            stats = index_documents(force_reindex=force)
+            with _state_lock:
+                _reindex_state["stats"] = stats
+                _reindex_state["finished_at"] = _now()
+                if stats.get("reason") == "already_running":
+                    _reindex_state["state"] = "skipped"
+                    _reindex_state["error"] = "Another indexer holds the database lock"
+                elif not stats.get("ok", False):
+                    _reindex_state["state"] = "failed"
+                    _reindex_state["error"] = (
+                        stats.get("warning") or stats.get("error") or stats.get("reason")
+                    )
+                elif stats.get("errors"):
+                    _reindex_state["state"] = "completed_with_errors"
+                else:
+                    _reindex_state["state"] = "succeeded"
+        except Exception as exc:
+            log.exception("Reindex failed")
+            with _state_lock:
+                _reindex_state["state"] = "failed"
+                _reindex_state["error"] = str(exc)[:500]
+                _reindex_state["finished_at"] = _now()
+
+    inline = os.environ.get("REINDEX_INLINE", "").strip().lower() in {"1", "true", "yes", "on"}
+    if inline:
+        run()
+    else:
+        threading.Thread(target=run, name="reindex", daemon=True).start()
+    code = 409 if _snapshot()["state"] == "skipped" and trigger == "manual" else 202
+    # A manual call that lost the advisory lock still accepted the request;
+    # report the terminal state so the caller can tell it did not start.
+    body = _snapshot()
+    if body["state"] == "running":
+        body["status"] = "started"
+        return 202, body
+    body["status"] = body["state"]
+    return code, body
+
+
+def _maybe_reindex_on_startup() -> None:
+    if not _startup_reindex_enabled():
+        return
+    if not os.environ.get("BASE44_API_KEY"):
+        log.warning(
+            "Skipping startup reindex: BASE44_API_KEY is not set on this service"
+        )
+        return
+    try:
+        finished, status = read_reindex_state(default_connect)
+    except Exception:
+        log.exception("Could not read indexer state; skipping startup reindex")
+        return
+    if is_reindex_due(finished, status, datetime.now(timezone.utc)):
+        log.info(
+            "Reindex is due (last_status=%s, last_finished_at=%s); starting in the background",
+            status,
+            finished,
+        )
+        start_reindex(False, "startup")
+    else:
+        log.info("Startup reindex not due (last finished %s, status %s)", finished, status)
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    scheduler = None
+    if _scheduler_enabled():
+        try:
+            scheduler = BackgroundScheduler(timezone=_chicago())
+            scheduler.add_job(
+                lambda: start_reindex(False, "schedule"),
+                weekly_reindex_trigger(),
+                id="weekly_reindex",
+                replace_existing=True,
+                max_instances=1,
+                coalesce=True,
+                misfire_grace_time=REINDEX_MISFIRE_GRACE_SECONDS,
+            )
+            scheduler.start()
+            log.info("Weekly reindex scheduled for %s", REINDEX_SCHEDULE_DESCRIPTION)
+        except Exception:
+            log.exception(
+                "Weekly scheduler did not start; POST /reindex still works"
+            )
+            scheduler = None
+    _maybe_reindex_on_startup()
+    try:
+        yield
+    finally:
+        if scheduler is not None:
+            scheduler.shutdown(wait=False)
+
 
 # ── Auth ──────────────────────────────────────────────────────────
 api_key_header = APIKeyHeader(name="X-API-Key", auto_error=False)
@@ -71,6 +272,7 @@ app = FastAPI(
     title="RC Brain Retrieval API",
     description="Semantic search over RC Brain's KnowledgeDocument library.",
     version="1.0.0",
+    lifespan=lifespan,
 )
 
 app.add_middleware(
@@ -249,6 +451,32 @@ def retrieve(req: RetrievalRequest):
         f"Retrieved {len(passages)} passage(s) for: {req.question[:80]!r}"
     )
     return RetrievalResponse(question=req.question, passages=passages)
+
+
+@app.post("/reindex", dependencies=[Depends(require_api_key)])
+def reindex(payload: Optional[dict[str, Any]] = Body(default=None)):
+    """
+    Start an incremental reindex in the background.
+
+    Unchanged documents (same updated_date, or the same content hash) are not
+    re-embedded. Chunks for documents Base44 no longer returns are deleted.
+    The index is not dropped. Send {"force": true} to re-embed every document.
+    """
+    force = False
+    if isinstance(payload, dict):
+        force = payload.get("force", False)
+        if isinstance(force, str):
+            force = force.strip().lower() in {"1", "true", "yes", "y", "on"}
+        else:
+            force = bool(force)
+    code, body = start_reindex(force=bool(force), trigger="manual")
+    return JSONResponse(status_code=code, content=body)
+
+
+@app.get("/reindex/status", dependencies=[Depends(require_api_key)])
+def reindex_status_endpoint():
+    """In-memory progress of this process, plus the last finished run when idle."""
+    return reindex_status()
 
 
 if __name__ == "__main__":
