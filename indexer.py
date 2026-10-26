@@ -6,8 +6,11 @@ Pulls KnowledgeDocument records from Base44, splits each one into passages,
 embeds those passages with Voyage AI, and upserts them into PostgreSQL + pgvector.
 
 The walk is incremental. A document is re-embedded only when its content hash
-changes (or when --force is set). Chunks whose Base44 document has been deleted
-are removed. The existing index is never truncated.
+changes, when its stored embed version is older than the current title-prefixed
+embedding, or when --force is set. Chunks whose Base44 document has been deleted
+are removed. The existing index is never truncated. A tsvector column is added
+in place for keyword search; embeddings already in the table are left as they are
+until a document is re-embedded.
 
 The Base44 list call uses cursor pagination
 (GET /api/apps/{app_id}/entities/KnowledgeDocument/v2/list on
@@ -124,6 +127,45 @@ def coerce_bool(value, default: bool = False) -> bool:
 def content_hash(text: str) -> str:
     """MD5 of the stripped document body. Existing rows were hashed this way."""
     return hashlib.md5(text.encode("utf-8")).hexdigest()
+
+
+# Bump when the string sent to Voyage changes. Rows stored before this version
+# are re-embedded on the next incremental reindex. The body hash stays the
+# same, so a title-only embedding change is not confused with an edit.
+EMBED_TEXT_VERSION = 2
+
+
+def passage_for_model(title: str | None, chunk: str) -> str:
+    """
+    Text embedded and reranked for a passage.
+
+    The stored chunk_text stays the passage itself. The title is prepended so
+    sibling documents (Vendor Leads vs Sponsorships) are distinguishable when
+    the body never repeats the title.
+    """
+    body = chunk or ""
+    heading = (title or "").strip()
+    if not heading or heading.casefold() == "untitled":
+        return body
+    prefix = f"Title: {heading}\n\n"
+    if body.startswith(prefix):
+        return body
+    return prefix + body
+
+
+def search_vector_expr(title_sql: str, topic_sql: str, body_sql: str) -> str:
+    """
+    Weighted tsvector. Title and topic are weight A; the passage is weight B.
+
+    `simple` keeps codes and names unstemmed. The same expression is used for
+    the backfill, writes, and the trigger.
+    """
+    return (
+        "setweight(to_tsvector('simple', "
+        f"coalesce({title_sql}, '') || ' ' || coalesce({topic_sql}, '')), 'A') || "
+        "setweight(to_tsvector('simple', "
+        f"coalesce({body_sql}, '')), 'B')"
+    )
 
 
 def normalize_timestamp(value) -> str | None:
@@ -652,6 +694,116 @@ def safe_rollback(conn) -> None:
         log.warning("Database rollback failed", exc_info=True)
 
 
+def ensure_embed_version_column(conn) -> bool:
+    """Additive. Existing rows stay NULL until they are re-embedded."""
+    try:
+        cur = conn.cursor()
+        cur.execute(
+            "ALTER TABLE indexed_documents ADD COLUMN IF NOT EXISTS embed_version INTEGER"
+        )
+        conn.commit()
+        return True
+    except Exception:
+        safe_rollback(conn)
+        log.warning(
+            "Could not add indexed_documents.embed_version; title embeddings will not refresh on their own",
+            exc_info=True,
+        )
+        return False
+
+
+def _ensure_search_trigger(conn) -> None:
+    expr_title = "NEW.title"
+    expr_topic = "NEW.topic"
+    expr_body = "NEW.chunk_text"
+    cur = conn.cursor()
+    cur.execute(
+        f"""
+        CREATE OR REPLACE FUNCTION knowledge_chunks_search_tsv_update() RETURNS trigger
+        LANGUAGE plpgsql AS $fn$
+        BEGIN
+            NEW.search_tsv := {search_vector_expr(expr_title, expr_topic, expr_body)};
+            RETURN NEW;
+        END
+        $fn$
+        """
+    )
+    cur.execute(
+        "DROP TRIGGER IF EXISTS knowledge_chunks_search_tsv_update ON knowledge_chunks"
+    )
+    for keyword in ("FUNCTION", "PROCEDURE"):
+        cur.execute("SAVEPOINT search_trigger")
+        try:
+            cur.execute(
+                f"""
+                CREATE TRIGGER knowledge_chunks_search_tsv_update
+                BEFORE INSERT OR UPDATE OF title, topic, chunk_text
+                ON knowledge_chunks
+                FOR EACH ROW
+                EXECUTE {keyword} knowledge_chunks_search_tsv_update()
+                """
+            )
+        except Exception:
+            cur.execute("ROLLBACK TO SAVEPOINT search_trigger")
+            cur.execute("RELEASE SAVEPOINT search_trigger")
+            continue
+        cur.execute("RELEASE SAVEPOINT search_trigger")
+        conn.commit()
+        return
+    log.warning(
+        "Could not create the search_tsv trigger; inserts and updates still set the column"
+    )
+    conn.commit()
+
+
+def ensure_search_schema(conn) -> bool:
+    """
+    Add full-text search without dropping or rewriting embeddings.
+
+    Adds knowledge_chunks.search_tsv, a GIN index, a trigger, and a backfill
+    of rows whose vector is still NULL. Safe to run on every boot.
+    """
+    try:
+        cur = conn.cursor()
+        cur.execute(
+            "ALTER TABLE knowledge_chunks ADD COLUMN IF NOT EXISTS search_tsv tsvector"
+        )
+        cur.execute(
+            f"""
+            UPDATE knowledge_chunks
+            SET search_tsv = {search_vector_expr("title", "topic", "chunk_text")}
+            WHERE search_tsv IS NULL
+            """
+        )
+        cur.execute(
+            """
+            CREATE INDEX IF NOT EXISTS knowledge_chunks_search_tsv_idx
+            ON knowledge_chunks USING GIN (search_tsv)
+            """
+        )
+        conn.commit()
+    except Exception:
+        safe_rollback(conn)
+        log.warning(
+            "Full-text column is not available; retrieval will use vectors only",
+            exc_info=True,
+        )
+        return False
+    try:
+        cur = conn.cursor()
+        cur.execute("ANALYZE knowledge_chunks")
+        conn.commit()
+    except Exception:
+        safe_rollback(conn)
+        log.info("ANALYZE knowledge_chunks skipped", exc_info=True)
+    try:
+        _ensure_search_trigger(conn)
+    except Exception:
+        safe_rollback(conn)
+        log.warning("Search trigger was not created", exc_info=True)
+    return True
+
+
 def ensure_updated_date_column(conn) -> bool:
     try:
         cur = conn.cursor()
@@ -762,20 +914,39 @@ def read_reindex_state(connect: Callable = default_connect) -> tuple[datetime | 
         conn.close()
 
 
-def load_local_index(conn, has_updated: bool) -> dict[str, dict]:
-    cur = conn.cursor()
+def load_local_index(conn, has_updated: bool, has_embed_version: bool) -> dict[str, dict]:
+    columns = ["document_id", "content_hash"]
     if has_updated:
-        cur.execute(
-            "SELECT document_id, content_hash, updated_date FROM indexed_documents"
-        )
-    else:
-        cur.execute("SELECT document_id, content_hash FROM indexed_documents")
+        columns.append("updated_date")
+    if has_embed_version:
+        columns.append("embed_version")
+    # Title is part of the embedded text, so a rename has to be visible here.
+    columns.append("title")
+    cur = conn.cursor()
+    cur.execute(f"SELECT {', '.join(columns)} FROM indexed_documents")
     local: dict[str, dict] = {}
     for row in cur.fetchall():
-        local[str(row[0])] = {
+        record = {
             "content_hash": row[1],
-            "updated_date": normalize_timestamp(row[2]) if has_updated else None,
+            "updated_date": None,
+            "embed_version": None,
+            "title": None,
         }
+        index = 2
+        if has_updated:
+            record["updated_date"] = normalize_timestamp(row[index])
+            index += 1
+        if has_embed_version:
+            version = row[index]
+            if version is not None:
+                try:
+                    version = int(version)
+                except (TypeError, ValueError):
+                    version = None
+            record["embed_version"] = version
+            index += 1
+        record["title"] = row[index]
+        local[str(row[0])] = record
     return local
 
 
@@ -819,13 +990,20 @@ def delete_document(conn, doc_id: str) -> None:
     conn.commit()
 
 
-def update_unchanged_document(conn, doc_id: str, merged: dict, remote_updated: str | None, chash: str, has_updated: bool) -> None:
+def update_unchanged_document(
+    conn,
+    doc_id: str,
+    merged: dict,
+    remote_updated: str | None,
+    chash: str,
+    has_updated: bool,
+    has_search: bool,
+) -> None:
     """Refresh metadata on chunks whose body did not change, without re-embedding."""
-    cur = conn.cursor()
-    cur.execute(
-        """
-        UPDATE knowledge_chunks
-        SET title = %s,
+    title = as_text(merged.get("title")) or "Untitled"
+    topic = as_text(merged.get("topic"))
+    assignments = """
+            title = %s,
             category = %s,
             topic = %s,
             subtopic = %s,
@@ -833,19 +1011,31 @@ def update_unchanged_document(conn, doc_id: str, merged: dict, remote_updated: s
             source_url = %s,
             source_date = %s,
             is_authoritative = %s
+    """
+    params: list = [
+        title,
+        as_text(merged.get("category")),
+        topic,
+        as_text(merged.get("subtopic")),
+        as_text(merged.get("source")),
+        as_text(merged.get("source_url")),
+        as_text(merged.get("source_date")),
+        coerce_bool(merged.get("is_authoritative"), default=False),
+    ]
+    if has_search:
+        assignments += f""",
+            search_tsv = {search_vector_expr("%s", "%s", "chunk_text")}
+        """
+        params.extend([title, topic])
+    params.append(doc_id)
+    cur = conn.cursor()
+    cur.execute(
+        f"""
+        UPDATE knowledge_chunks
+        SET {assignments}
         WHERE document_id = %s
         """,
-        (
-            as_text(merged.get("title")) or "Untitled",
-            as_text(merged.get("category")),
-            as_text(merged.get("topic")),
-            as_text(merged.get("subtopic")),
-            as_text(merged.get("source")),
-            as_text(merged.get("source_url")),
-            as_text(merged.get("source_date")),
-            coerce_bool(merged.get("is_authoritative"), default=False),
-            doc_id,
-        ),
+        params,
     )
     if has_updated:
         cur.execute(
@@ -877,53 +1067,58 @@ def replace_document(
     chash: str,
     remote_updated: str | None,
     has_updated: bool,
+    has_embed_version: bool,
+    has_search: bool,
 ) -> None:
     title = as_text(merged.get("title")) or "Untitled"
+    topic = as_text(merged.get("topic"))
     cur = conn.cursor()
     cur.execute("DELETE FROM knowledge_chunks WHERE document_id = %s", (doc_id,))
     cur.execute("DELETE FROM indexed_documents WHERE document_id = %s", (doc_id,))
+    search_column = ""
+    search_value = ""
     for idx, (chunk, embedding) in enumerate(zip(chunks, embeddings)):
+        params: list = [
+            doc_id,
+            title,
+            as_text(merged.get("category")),
+            topic,
+            as_text(merged.get("subtopic")),
+            as_text(merged.get("source")),
+            as_text(merged.get("source_url")),
+            as_text(merged.get("source_date")),
+            coerce_bool(merged.get("is_authoritative"), default=False),
+            idx,
+            chunk,
+            json.dumps(embedding),
+        ]
+        if has_search:
+            search_column = ", search_tsv"
+            search_value = ", " + search_vector_expr("%s", "%s", "%s")
+            params.extend([title, topic, chunk])
         cur.execute(
-            """
+            f"""
             INSERT INTO knowledge_chunks
                 (document_id, title, category, topic, subtopic,
                  source, source_url, source_date, is_authoritative,
-                 chunk_index, chunk_text, embedding)
-            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s::vector)
+                 chunk_index, chunk_text, embedding{search_column})
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s::vector{search_value})
             """,
-            (
-                doc_id,
-                title,
-                as_text(merged.get("category")),
-                as_text(merged.get("topic")),
-                as_text(merged.get("subtopic")),
-                as_text(merged.get("source")),
-                as_text(merged.get("source_url")),
-                as_text(merged.get("source_date")),
-                coerce_bool(merged.get("is_authoritative"), default=False),
-                idx,
-                chunk,
-                json.dumps(embedding),
-            ),
+            params,
         )
+    columns = ["document_id", "title", "chunk_count", "content_hash"]
+    values: list = [doc_id, title, len(chunks), chash]
     if has_updated:
-        cur.execute(
-            """
-            INSERT INTO indexed_documents
-                (document_id, title, chunk_count, content_hash, updated_date)
-            VALUES (%s, %s, %s, %s, %s)
-            """,
-            (doc_id, title, len(chunks), chash, remote_updated),
-        )
-    else:
-        cur.execute(
-            """
-            INSERT INTO indexed_documents
-                (document_id, title, chunk_count, content_hash)
-            VALUES (%s, %s, %s, %s)
-            """,
-            (doc_id, title, len(chunks), chash),
-        )
+        columns.append("updated_date")
+        values.append(remote_updated)
+    if has_embed_version:
+        columns.append("embed_version")
+        values.append(EMBED_TEXT_VERSION)
+    placeholders = ", ".join(["%s"] * len(values))
+    cur.execute(
+        f"INSERT INTO indexed_documents ({', '.join(columns)}) VALUES ({placeholders})",
+        values,
+    )
     conn.commit()
 
 
@@ -943,8 +1138,30 @@ def delete_absent(conn, remote_ids: list[str]) -> tuple[int, int]:
     return docs_deleted, chunks_deleted
 
 
-def sync_one(conn, record: dict, storage_id: str, local_row: dict | None, force: bool, client: Base44Client, embed, has_updated: bool, stats: dict) -> str:
+def _embed_version_current(local_row: dict | None, has_embed_version: bool) -> bool:
+    if not has_embed_version:
+        # The column could not be added, so there is nowhere to record progress.
+        return True
+    if not local_row:
+        return False
+    return local_row.get("embed_version") == EMBED_TEXT_VERSION
+
+
+def sync_one(
+    conn,
+    record: dict,
+    storage_id: str,
+    local_row: dict | None,
+    force: bool,
+    client: Base44Client,
+    embed,
+    has_updated: bool,
+    has_embed_version: bool,
+    has_search: bool,
+    stats: dict,
+) -> str:
     remote_updated = normalize_timestamp(record.get("updated_date"))
+    version_ok = _embed_version_current(local_row, has_embed_version)
     if (
         not force
         and has_updated
@@ -952,6 +1169,7 @@ def sync_one(conn, record: dict, storage_id: str, local_row: dict | None, force:
         and local_row.get("content_hash")
         and remote_updated
         and local_row.get("updated_date") == remote_updated
+        and version_ok
         and chunks_exist(conn, storage_id)
     ):
         return "skipped"
@@ -970,15 +1188,36 @@ def sync_one(conn, record: dict, storage_id: str, local_row: dict | None, force:
         return "empty"
 
     chash = content_hash(content)
-    if not force and local_row and local_row.get("content_hash") == chash and chunks_exist(conn, storage_id):
-        update_unchanged_document(conn, storage_id, merged, remote_updated, chash, has_updated)
+    title_changed = local_row is not None and (local_row.get("title") or "") != title
+    if (
+        not force
+        and local_row
+        and local_row.get("content_hash") == chash
+        and version_ok
+        and not title_changed
+        and chunks_exist(conn, storage_id)
+    ):
+        update_unchanged_document(
+            conn, storage_id, merged, remote_updated, chash, has_updated, has_search
+        )
         return "skipped"
+
+    if local_row and local_row.get("content_hash") == chash and (not version_ok or title_changed):
+        stats["title_reembeds"] += 1
+        log.info(
+            "Re-embedding '%s' (%s) so the vector includes the document title",
+            title,
+            storage_id,
+        )
 
     chunks = chunk_text(content)
     if not chunks:
         delete_document(conn, storage_id)
         return "empty"
-    embeddings = embed(chunks, input_type="document")
+    embeddings = embed(
+        [passage_for_model(title, chunk) for chunk in chunks],
+        input_type="document",
+    )
     if len(embeddings) != len(chunks):
         raise RuntimeError(
             f"embedding count {len(embeddings)} != chunk count {len(chunks)} for {storage_id}"
@@ -992,6 +1231,8 @@ def sync_one(conn, record: dict, storage_id: str, local_row: dict | None, force:
         chash,
         remote_updated,
         has_updated,
+        has_embed_version,
+        has_search,
     )
     stats["chunks_written"] += len(chunks)
     log.info("Indexed '%s' (%s) → %s chunk(s)", title, storage_id, len(chunks))
@@ -1011,6 +1252,7 @@ def _empty_stats(force: bool) -> dict:
         "empty": 0,
         "errors": 0,
         "error_details": [],
+        "title_reembeds": 0,
     }
 
 
@@ -1074,10 +1316,12 @@ def index_documents(
     try:
         conn = connect()
         has_updated = ensure_updated_date_column(conn)
+        has_embed_version = ensure_embed_version_column(conn)
+        has_search = ensure_search_schema(conn)
         if ensure_state_table(conn):
             mark_run_started(conn)
         try:
-            local = load_local_index(conn, has_updated)
+            local = load_local_index(conn, has_updated, has_embed_version)
             safe_rollback(conn)
             local_ids = set(local)
             seen_remote: set[str] = set()
@@ -1103,6 +1347,8 @@ def index_documents(
                         client,
                         embed,
                         has_updated,
+                        has_embed_version,
+                        has_search,
                         stats,
                     )
                     stats[outcome] += 1

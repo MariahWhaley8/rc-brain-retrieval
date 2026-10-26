@@ -13,6 +13,7 @@ RUN pip install --no-cache-dir -r requirements.txt
 
 COPY api.py .
 COPY indexer.py .
+COPY search.py .
 
 ENV PORT=8000
 EXPOSE $PORT

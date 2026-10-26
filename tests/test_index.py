@@ -17,6 +17,7 @@ class DB:
         self.locked = False
         self.run_status = None
         self.run_error = None
+        self.statements = []
 
 
 class Conn:
@@ -51,7 +52,24 @@ class Cur:
         self.rowcount = 0
         self._one = None
         self._all = []
+        db.statements.append(statement)
 
+        if statement.startswith(("savepoint", "release savepoint", "rollback to savepoint")):
+            return
+        if statement.startswith("analyze "):
+            return
+        if statement.startswith("alter table knowledge_chunks"):
+            return
+        if statement.startswith("create index"):
+            return
+        if statement.startswith("create or replace function"):
+            return
+        if statement.startswith("drop trigger"):
+            return
+        if statement.startswith("create trigger"):
+            return
+        if statement.startswith("update knowledge_chunks") and "search_tsv is null" in statement:
+            return
         if "pg_try_advisory_lock" in statement:
             if db.locked:
                 self._one = (False,)
@@ -78,10 +96,17 @@ class Cur:
             self._one = (None, db.run_status)
             return
         if statement.startswith("select document_id"):
-            self._all = [
-                (doc_id, row["content_hash"], row.get("updated_date"))
-                for doc_id, row in db.docs.items()
-            ]
+            rows = []
+            for doc_id, row in db.docs.items():
+                item = [doc_id, row["content_hash"]]
+                if "updated_date" in statement:
+                    item.append(row.get("updated_date"))
+                if "embed_version" in statement:
+                    item.append(row.get("embed_version"))
+                if statement.endswith(" title") or ", title" in statement:
+                    item.append(row.get("title"))
+                rows.append(tuple(item))
+            self._all = rows
             return
         if statement.startswith("select 1 from knowledge_chunks"):
             chunks = db.chunks.get(params[0]) or []
@@ -111,10 +136,12 @@ class Cur:
             db.docs.pop(params[0], None)
             return
         if statement.startswith("update knowledge_chunks"):
-            for chunk in db.chunks.get(params[8], []):
+            doc_id = params[-1]
+            for chunk in db.chunks.get(doc_id, []):
                 chunk["title"] = params[0]
                 chunk["source_date"] = params[6]
                 chunk["source"] = params[4]
+                chunk["topic"] = params[2]
             return
         if statement.startswith("update indexed_documents"):
             doc_id = params[2]
@@ -138,11 +165,20 @@ class Cur:
             )
             return
         if statement.startswith("insert into indexed_documents"):
+            updated = None
+            version = None
+            cursor = 4
+            if "updated_date" in statement:
+                updated = params[cursor]
+                cursor += 1
+            if "embed_version" in statement:
+                version = params[cursor]
             db.docs[params[0]] = {
                 "title": params[1],
                 "chunk_count": params[2],
                 "content_hash": params[3],
-                "updated_date": params[4] if len(params) > 4 else None,
+                "updated_date": updated,
+                "embed_version": version,
             }
             return
         raise AssertionError(f"unexpected SQL: {statement}")
@@ -189,12 +225,13 @@ def embedder(store):
     return embed
 
 
-def seed(db, doc_id, body, updated="2026-06-25T00:00:00", title="Stored"):
+def seed(db, doc_id, body, updated="2026-06-25T00:00:00", title="Stored", embed_version=indexer.EMBED_TEXT_VERSION):
     db.docs[doc_id] = {
         "title": title,
         "chunk_count": 1,
         "content_hash": content_hash(body),
         "updated_date": updated,
+        "embed_version": embed_version,
     }
     db.chunks[doc_id] = [
         {"text": body, "title": title, "source": "drive", "source_url": None, "source_date": None, "category": None, "topic": None}
@@ -228,6 +265,14 @@ def test_unchanged_updated_date_does_not_fetch_or_embed():
     assert catalog.gets == []
     assert embedded == []
     assert db.chunks["doc-1"][0]["text"] == body
+    joined = "\n".join(db.statements)
+    assert "add column if not exists search_tsv" in joined
+    assert "add column if not exists embed_version" in joined
+    assert "create index if not exists knowledge_chunks_search_tsv_idx" in joined
+    assert "using gin" in joined
+    assert "drop table" not in joined
+    assert "truncate" not in joined
+    assert "drop column" not in joined
 
 
 def test_changed_body_is_reembedded_and_deleted_docs_are_removed():
@@ -286,7 +331,7 @@ def test_same_hash_updates_metadata_without_embedding():
         [{"id": "doc-1", "title": "Old title", "updated_date": "2026-10-02T00:00:00"}],
         bodies={
             "doc-1": {
-                "title": "New title",
+                "title": "Old title",
                 "content": body,
                 "updated_date": "2026-10-02T00:00:00",
                 "source_date": "2026-09-30",
@@ -297,11 +342,37 @@ def test_same_hash_updates_metadata_without_embedding():
     stats = run(db, catalog, embedded=embedded)
     assert stats["skipped"] == 1
     assert stats["indexed"] == 0
+    assert stats["title_reembeds"] == 0
     assert embedded == []
-    assert db.chunks["doc-1"][0]["title"] == "New title"
+    assert db.chunks["doc-1"][0]["title"] == "Old title"
     assert db.chunks["doc-1"][0]["source_date"] == "2026-09-30"
     assert db.chunks["doc-1"][0]["text"] == body
     assert db.docs["doc-1"]["updated_date"] == "2026-10-02T00:00:00"
+
+
+def test_renamed_document_is_reembedded_with_the_new_title():
+    db = DB()
+    body = "Same words as June."
+    seed(db, "doc-1", body, updated=None, title="Vendor Leads")
+    embedded = []
+    catalog = Catalog(
+        [{"id": "doc-1", "title": "Vendor Leads", "updated_date": "2026-10-02T00:00:00"}],
+        bodies={
+            "doc-1": {
+                "title": "Sponsorships",
+                "content": body,
+                "updated_date": "2026-10-02T00:00:00",
+                "source_date": "2026-09-30",
+            }
+        },
+    )
+    stats = run(db, catalog, embedded=embedded)
+    assert stats["indexed"] == 1
+    assert stats["title_reembeds"] == 1
+    assert embedded[0][0] == "Title: Sponsorships\n\n" + body
+    assert db.chunks["doc-1"][0]["text"] == body
+    assert db.chunks["doc-1"][0]["title"] == "Sponsorships"
+    assert db.docs["doc-1"]["title"] == "Sponsorships"
 
 
 def test_stored_legacy_id_is_kept_when_base44_also_sends_id():
@@ -310,8 +381,8 @@ def test_stored_legacy_id_is_kept_when_base44_also_sends_id():
     seed(db, "stored-id", body, updated=None)
     embedded = []
     catalog = Catalog(
-        [{"id": "new-id", "_id": "stored-id", "title": "Legacy", "updated_date": "2026-10-01T00:00:00"}],
-        bodies={"new-id": {"id": "new-id", "title": "Legacy", "content": body, "updated_date": "2026-10-01T00:00:00"}},
+        [{"id": "new-id", "_id": "stored-id", "title": "Stored", "updated_date": "2026-10-01T00:00:00"}],
+        bodies={"new-id": {"id": "new-id", "title": "Stored", "content": body, "updated_date": "2026-10-01T00:00:00"}},
     )
     stats = run(db, catalog, embedded=embedded)
     assert catalog.gets == ["new-id"]
@@ -391,6 +462,55 @@ def test_empty_content_removes_stale_chunks():
     assert stats["empty"] == 1
     assert "doc-1" not in db.chunks
     assert "doc-1" not in db.docs
+
+
+def test_old_embed_version_reembeds_with_the_title_and_keeps_the_passage():
+    db = DB()
+    body = "Same body about vendor leads."
+    seed(db, "doc-1", body, title="Vendor Leads", embed_version=None)
+    embedded = []
+    catalog = Catalog(
+        [{"id": "doc-1", "title": "Vendor Leads", "updated_date": "2026-06-25T00:00:00"}],
+        bodies={
+            "doc-1": {
+                "content": body,
+                "title": "Vendor Leads",
+                "updated_date": "2026-06-25T00:00:00",
+                "topic": "vendors",
+            }
+        },
+    )
+    stats = run(db, catalog, embedded=embedded)
+    assert stats["indexed"] == 1
+    assert stats["title_reembeds"] == 1
+    assert embedded[0][0] == "Title: Vendor Leads\n\n" + body
+    assert db.chunks["doc-1"][0]["text"] == body
+    assert db.docs["doc-1"]["embed_version"] == indexer.EMBED_TEXT_VERSION
+    assert db.docs["doc-1"]["content_hash"] == content_hash(body)
+    insert = next(sql for sql in db.statements if sql.startswith("insert into knowledge_chunks"))
+    assert "to_tsvector('simple'" in insert
+    assert "search_tsv" in insert
+
+
+def test_changed_body_embeds_the_title_prefix():
+    db = DB()
+    seed(db, "doc-1", "old body", title="Old")
+    embedded = []
+    catalog = Catalog(
+        [{"id": "doc-1", "title": "Sponsorships", "updated_date": "2026-10-23T00:00:00"}],
+        bodies={
+            "doc-1": {
+                "content": "New sponsorship copy.",
+                "title": "Sponsorships",
+                "updated_date": "2026-10-23T00:00:00",
+            }
+        },
+    )
+    stats = run(db, catalog, embedded=embedded)
+    assert stats["indexed"] == 1
+    assert stats["title_reembeds"] == 0
+    assert embedded[0][0].startswith("Title: Sponsorships\n\nNew sponsorship copy.")
+    assert db.chunks["doc-1"][0]["text"] == "New sponsorship copy."
 
 
 def test_force_reembeds_even_when_the_date_matches():
