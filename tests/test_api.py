@@ -40,8 +40,10 @@ def reset_state():
             )
 
     clear()
+    api._search_ready = True
     yield
     clear()
+    api._search_ready = True
 
 
 @pytest.fixture
@@ -168,54 +170,90 @@ def test_status_when_idle_includes_the_schedule(client, monkeypatch):
     assert body["last_status"] is None
 
 
+def _row(doc_id, title, text, chunk_index=0, category="hr", topic="benefits", score=0.2):
+    return (
+        doc_id,
+        title,
+        category,
+        topic,
+        "Drive",
+        "https://example.com/handbook",
+        "2026-06-01",
+        True,
+        text,
+        chunk_index,
+        score,
+    )
+
+
+class RecordingDB:
+    """Fake connection. Keyword and vector queries can return different rows."""
+
+    def __init__(self, rows_for):
+        self.rows_for = rows_for
+        self.statements = []
+        self.params = []
+        self.rerank_inputs = []
+
+    def install(self, monkeypatch):
+        db = self
+
+        class Embed:
+            embeddings = [[0.1, 0.2, 0.3]]
+
+        class Cur:
+            def execute(self, sql, params=None):
+                db.statements.append(sql)
+                db.params.append(params)
+
+            def fetchall(self):
+                sql = db.statements[-1]
+                if "search_tsv" in sql:
+                    return db.rows_for("keyword")
+                return db.rows_for("vector")
+
+        class Conn:
+            def cursor(self):
+                return Cur()
+
+            def close(self):
+                return None
+
+            def commit(self):
+                return None
+
+            def rollback(self):
+                return None
+
+        @contextmanager
+        def fake_db():
+            yield Conn()
+
+        def fake_rerank(query, docs, model, top_k):
+            db.rerank_inputs = list(docs)
+
+            class Result:
+                pass
+
+            result = Result()
+            items = []
+            for index in range(min(top_k, len(docs))):
+                item = Result()
+                item.index = index
+                item.relevance_score = 1 - (index * 0.01)
+                items.append(item)
+            result.results = items
+            return result
+
+        monkeypatch.setattr(api.vo, "embed", lambda *args, **kwargs: Embed())
+        monkeypatch.setattr(api.vo, "rerank", fake_rerank)
+        monkeypatch.setattr(api, "get_db", fake_db)
+        return db
+
+
 def test_retrieve_response_shape_is_unchanged(client, monkeypatch):
-    executed = {}
-
-    class Embed:
-        embeddings = [[0.1, 0.2, 0.3]]
-
-    class RerankItem:
-        index = 0
-        relevance_score = 0.42
-
-    class Rerank:
-        results = [RerankItem()]
-
-    class Cur:
-        def execute(self, sql, params=None):
-            executed["sql"] = sql
-            executed["params"] = params
-
-        def fetchall(self):
-            return [
-                (
-                    "doc-1",
-                    "Employee handbook",
-                    "hr",
-                    "benefits",
-                    "Drive",
-                    "https://example.com/handbook",
-                    "2026-06-01",
-                    True,
-                    "PTO accrues each pay period.",
-                    0.2,
-                )
-            ]
-
-    class Conn:
-        def cursor(self):
-            return Cur()
-
-        def close(self):
-            return None
-
-    @contextmanager
-    def fake_db():
-        yield Conn()
-
-    monkeypatch.setattr(api.vo, "embed", lambda *args, **kwargs: Embed())
-    monkeypatch.setattr(api.vo, "rerank", lambda *args, **kwargs: Rerank())
-    monkeypatch.setattr(api, "get_db", fake_db)
+    handbook = _row("doc-1", "Employee handbook", "PTO accrues each pay period.", score=0.2)
+    db = RecordingDB(lambda kind: [handbook]).install(monkeypatch)
 
     denied = client.post("/retrieve", json={"question": "How does PTO work?"})
     assert denied.status_code == 401
@@ -241,10 +279,139 @@ def test_retrieve_response_shape_is_unchanged(client, monkeypatch):
     assert passage["source_date"] == "2026-06-01"
     assert passage["is_authoritative"] is True
     assert passage["chunk_text"] == "PTO accrues each pay period."
-    assert passage["relevance_score"] == 0.42
-    sql = " ".join(executed["sql"].split())
-    assert "document_id, title, category, topic, source, source_url, source_date, is_authoritative, chunk_text" in sql
-    assert "category = %s" in sql
+    assert passage["relevance_score"] == 1
+    sqls = [" ".join(sql.split()) for sql in db.statements]
+    vector_sql = next(sql for sql in sqls if "embedding <=>" in sql)
+    assert "document_id, title, category, topic, source, source_url, source_date, is_authoritative, chunk_text" in vector_sql
+    assert "category = %s" in vector_sql
+    assert "NOT ILIKE ALL" in vector_sql
+    assert "enable_indexscan = off" in " ".join(sqls)
+    assert any("RC Brain Agent Evaluation Q&A" in str(params) for params in db.params)
+    assert db.rerank_inputs == ["Title: Employee handbook\n\nPTO accrues each pay period."]
+    vector_params = next(
+        params
+        for sql, params in zip(db.statements, db.params)
+        if params and "embedding <=>" in sql
+    )
+    assert vector_params[-1] >= 80
+
+
+def test_default_passage_count_is_eight(client, monkeypatch):
+    rows = [
+        _row(f"doc-{i}", f"Doc {i}", f"Passage {i}.", chunk_index=0)
+        for i in range(12)
+    ]
+    RecordingDB(lambda kind: rows if kind == "vector" else []).install(monkeypatch)
+    response = client.post(
+        "/retrieve",
+        headers=AUTH,
+        json={"question": "How does PTO work?"},
+    )
+    assert response.status_code == 200
+    assert [item["document_id"] for item in response.json()["passages"]] == [
+        f"doc-{i}" for i in range(8)
+    ]
+
+
+def test_keyword_hits_survive_an_empty_vector_search(client, monkeypatch):
+    hans = _row(
+        "kickstarter-3",
+        "EMS Kickstarter Part 3 of 9",
+        "Hans walked through revenue examples for the model years.",
+        topic="ems",
+        category="transcripts",
+    )
+
+    def rows_for(kind):
+        if kind == "keyword":
+            return [hans]
+        return []
+
+    RecordingDB(rows_for).install(monkeypatch)
+    response = client.post(
+        "/retrieve",
+        headers=AUTH,
+        json={"question": "Hans revenue examples and model years"},
+    )
+    assert response.status_code == 200
+    passages = response.json()["passages"]
+    assert len(passages) == 1
+    assert passages[0]["document_id"] == "kickstarter-3"
+    assert passages[0]["chunk_text"].startswith("Hans walked")
+    assert "Title:" not in passages[0]["chunk_text"]
+
+
+def test_per_document_cap_keeps_other_sources(client, monkeypatch):
+    rows = [
+        _row("transcript", "Staffing Part 1 of 9", "Part one.", chunk_index=0),
+        _row("transcript", "Staffing Part 2 of 9", "Part two.", chunk_index=1),
+        _row("transcript", "Staffing Part 3 of 9", "Part three.", chunk_index=2),
+        _row("transcript", "Staffing Part 4 of 9", "Part four.", chunk_index=3),
+        _row("transcript", "Staffing Part 5 of 9", "Part five.", chunk_index=4),
+        _row("official", "EMS Top 10 Questions", "Minimum of two trucks.", chunk_index=0),
+        _row("portal", "Waste lines of business", "Industrial, commercial, residential.", chunk_index=0),
+    ]
+    RecordingDB(lambda kind: rows if kind == "vector" else []).install(monkeypatch)
+    response = client.post(
+        "/retrieve",
+        headers=AUTH,
+        json={"question": "minimum ambulances on a shift", "top_k": 4},
+    )
+    ids = [item["document_id"] for item in response.json()["passages"]]
+    assert ids == ["transcript", "transcript", "official", "portal"]
+    assert ids.count("transcript") == 2
+
+
+def test_eval_answer_keys_are_excluded_even_if_the_database_returns_them(client, monkeypatch):
+    rows = [
+        _row(
+            "eval-key",
+            "RC Brain Agent Evaluation Q&A — question 10",
+            "The answer key says $75k.",
+            chunk_index=0,
+        ),
+        _row(
+            "bread",
+            "Bread Acquisition Strategy",
+            "Working capital of seventy five thousand.",
+            chunk_index=0,
+        ),
+    ]
+    db = RecordingDB(lambda kind: rows if kind == "vector" else []).install(monkeypatch)
+    response = client.post(
+        "/retrieve",
+        headers=AUTH,
+        json={
+            "question": "bread working capital",
+            "exclude_titles": "draft notes",
+            "exclude_categories": ["Archive"],
+        },
+    )
+    ids = [item["document_id"] for item in response.json()["passages"]]
+    assert ids == ["bread"]
+    vector_sql = " ".join(next(sql for sql in db.statements if "embedding <=>" in sql).split())
+    assert "NOT ILIKE ALL" in vector_sql
+    assert "category <> ALL" in vector_sql
+    flat = repr(db.params)
+    assert "RC Brain Agent Evaluation Q&A" in flat
+    assert "draft notes" in flat
+    assert "Archive" in flat
+
+
+def test_single_document_corpus_still_fills_the_requested_count(client, monkeypatch):
+    rows = [
+        _row("only", "Hans notes", f"Chunk {i} mentions Hans.", chunk_index=i)
+        for i in range(6)
+    ]
+    RecordingDB(lambda kind: rows if kind == "vector" else []).install(monkeypatch)
+    response = client.post(
+        "/retrieve",
+        headers=AUTH,
+        json={"question": "Hans revenue examples", "top_k": 4},
+    )
+    passages = response.json()["passages"]
+    assert len(passages) == 4
+    assert {item["document_id"] for item in passages} == {"only"}
 
 
 def test_health_shape(client, monkeypatch):

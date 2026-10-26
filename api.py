@@ -7,9 +7,14 @@ FastAPI service that answers "what are the most relevant passages for this quest
 Base44 calls POST /retrieve with the user's question.
 The API returns the top passages from the knowledge store, ready to pass to Claude.
 
+Search is hybrid. A full-text leg (Postgres `simple` tsvector) and an exact
+vector leg are merged with reciprocal rank fusion, then Voyage reranks the
+merged candidates. Titles containing "RC Brain Agent Evaluation Q&A" are
+always left out.
+
 Endpoints:
     GET  /health           — liveness check; returns chunk count
-    POST /retrieve         — semantic search + rerank; returns top passages
+    POST /retrieve         — hybrid search + rerank; returns top passages
     POST /reindex          — start an incremental reindex in the background
     GET  /reindex/status   — progress of the latest reindex
 
@@ -19,8 +24,15 @@ Environment variables (set in Railway):
     VOYAGE_EMBED_MODEL  - Model used at index time (default: voyage-large-2)
                           MUST match the model used by the indexer.
     VOYAGE_RERANK_MODEL - Reranker model (default: rerank-2)
-    TOP_K               - Candidates to fetch from Postgres before reranking (default: 20)
-    RERANK_TOP_N        - Final passages returned after reranking (default: 5)
+    TOP_K               - Candidates kept after fusion, before reranking (default: 40)
+    RERANK_TOP_N        - Final passages when the request omits top_k (default: 8)
+    MAX_CHUNKS_PER_DOCUMENT
+                        - Final cap per document (default: 2). 0 disables it.
+    CANDIDATE_CHUNKS_PER_DOCUMENT
+                        - Cap per document in the rerank candidate set (default: 4)
+    VECTOR_EXACT_SEARCH - "false" leaves ANN index scans on (default: exact scan)
+    RETRIEVAL_EXCLUDE_TITLES
+                        - Extra title substrings to drop, separated by "||"
     PORT                - Port to listen on (Railway sets this automatically)
     RETRIEVAL_API_KEY   - Secret key callers must send as X-API-Key header
     BASE44_API_KEY      - Base44 personal access token used by the indexer
@@ -28,6 +40,8 @@ Environment variables (set in Railway):
     REINDEX_SCHEDULER   - "false" disables the Monday 19:00 America/Chicago job
     REINDEX_ON_STARTUP  - "false" disables the catch-up reindex when the last
                           successful run is missing or older than 8 days
+    RETRIEVAL_SCHEMA_ON_START
+                        - "false" skips the additive full-text migration at boot
 """
 
 import os
@@ -47,8 +61,10 @@ from fastapi import Body, FastAPI, HTTPException, Security, Depends
 from fastapi.responses import JSONResponse
 from fastapi.security.api_key import APIKeyHeader
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel
+from pydantic import BaseModel, field_validator
 from dotenv import load_dotenv
+
+import search
 
 load_dotenv()
 
@@ -62,8 +78,10 @@ log = logging.getLogger(__name__)
 
 from indexer import (  # noqa: E402
     default_connect,
+    ensure_search_schema,
     index_documents,
     is_reindex_due,
+    passage_for_model,
     read_reindex_state,
 )
 
@@ -72,9 +90,18 @@ VOYAGE_API_KEY      = os.environ["VOYAGE_API_KEY"]
 DATABASE_URL        = os.environ["DATABASE_URL"]
 VOYAGE_EMBED_MODEL  = os.environ.get("VOYAGE_EMBED_MODEL",  "voyage-large-2")
 VOYAGE_RERANK_MODEL = os.environ.get("VOYAGE_RERANK_MODEL", "rerank-2")
-TOP_K               = int(os.environ.get("TOP_K",         "20"))
-RERANK_TOP_N        = int(os.environ.get("RERANK_TOP_N",  "5"))
+TOP_K               = int(os.environ.get("TOP_K",         "40"))
+RERANK_TOP_N        = int(os.environ.get("RERANK_TOP_N",  "8"))
+MAX_CHUNKS_PER_DOCUMENT = int(os.environ.get("MAX_CHUNKS_PER_DOCUMENT", "2"))
+CANDIDATE_CHUNKS_PER_DOCUMENT = int(os.environ.get("CANDIDATE_CHUNKS_PER_DOCUMENT", "4"))
+# A caller can still ask for a long list. These caps keep one request from
+# sending hundreds of passages to the reranker.
+MAX_FINAL_N = 100
+MAX_CANDIDATES = 200
 RETRIEVAL_API_KEY   = os.environ.get("RETRIEVAL_API_KEY", "")
+
+_search_ready = False
+_search_lock = threading.Lock()
 
 vo = voyageai.Client(api_key=VOYAGE_API_KEY)
 
@@ -204,6 +231,47 @@ def start_reindex(force: bool, trigger: str) -> tuple[int, dict]:
     return code, body
 
 
+def ensure_search_ready(conn) -> bool:
+    """Add the tsvector column if this process has not done so yet."""
+    global _search_ready
+    if _search_ready:
+        return True
+    with _search_lock:
+        if _search_ready:
+            return True
+        ready = ensure_search_schema(conn)
+        if ready:
+            _search_ready = True
+        return ready
+
+
+def _prepare_search_on_startup() -> None:
+    if not _env_flag("RETRIEVAL_SCHEMA_ON_START", True):
+        return
+    try:
+        with get_db() as conn:
+            ensure_search_ready(conn)
+    except Exception:
+        log.exception("Full-text setup failed at startup; /retrieve will retry")
+
+
+def passage_limits(requested: Optional[int]) -> tuple[int, int, int, int, int]:
+    """Return final_n, candidate_n, pool_n, final_cap, candidate_cap."""
+    if requested is not None and requested > 0:
+        final_n = min(int(requested), MAX_FINAL_N)
+    else:
+        final_n = max(1, RERANK_TOP_N)
+    candidates_n = min(max(final_n * 4, TOP_K, final_n), MAX_CANDIDATES)
+    pool_n = min(max(candidates_n * 3, 80), 400)
+    final_cap = MAX_CHUNKS_PER_DOCUMENT
+    candidate_cap = CANDIDATE_CHUNKS_PER_DOCUMENT
+    if final_cap <= 0 or candidate_cap <= 0:
+        candidate_cap = 0 if final_cap <= 0 else candidate_cap
+    else:
+        candidate_cap = max(candidate_cap, final_cap)
+    return final_n, candidates_n, pool_n, final_cap, candidate_cap
+
+
 def _maybe_reindex_on_startup() -> None:
     if not _startup_reindex_enabled():
         return
@@ -250,6 +318,7 @@ async def lifespan(app: FastAPI):
                 "Weekly scheduler did not start; POST /reindex still works"
             )
             scheduler = None
+    _prepare_search_on_startup()
     _maybe_reindex_on_startup()
     try:
         yield
@@ -270,7 +339,7 @@ def require_api_key(key: str = Security(api_key_header)):
 # ── App ───────────────────────────────────────────────────────────────
 app = FastAPI(
     title="RC Brain Retrieval API",
-    description="Semantic search over RC Brain's KnowledgeDocument library.",
+    description="Hybrid search over RC Brain's KnowledgeDocument library.",
     version="1.0.0",
     lifespan=lifespan,
 )
@@ -301,6 +370,20 @@ class RetrievalRequest(BaseModel):
     top_k:      Optional[int] = None
     category:   Optional[str] = None
     source:     Optional[str] = None
+    # Substrings matched against the document title, in addition to the
+    # built-in eval-key exclusion. A single string is accepted too.
+    exclude_titles: Optional[list[str]] = None
+    # Exact category values to leave out of the result.
+    exclude_categories: Optional[list[str]] = None
+
+    @field_validator("exclude_titles", "exclude_categories", mode="before")
+    @classmethod
+    def _string_or_list(cls, value):
+        if value is None or value == "":
+            return None
+        if isinstance(value, str):
+            return [value]
+        return value
 
 
 class Passage(BaseModel):
@@ -344,18 +427,47 @@ def health():
         raise HTTPException(status_code=500, detail=str(exc))
 
 
+def _keep_hit(hit: search.ChunkHit, titles: list[str], categories: list[str]) -> bool:
+    if search.title_is_excluded(hit.title, titles):
+        return False
+    if search.category_is_excluded(hit.category, categories):
+        return False
+    return True
+
+
+def _passages_from_hits(hits: list[search.ChunkHit]) -> list[Passage]:
+    passages = []
+    for hit in hits:
+        passages.append(
+            Passage(
+                document_id=hit.document_id,
+                title=hit.title or "",
+                category=hit.category,
+                topic=hit.topic,
+                source=hit.source,
+                source_url=hit.source_url,
+                source_date=hit.source_date,
+                is_authoritative=hit.is_authoritative,
+                chunk_text=hit.chunk_text,
+                relevance_score=float(hit.score or 0.0),
+            )
+        )
+    return passages
+
+
 @app.post("/retrieve", response_model=RetrievalResponse, dependencies=[Depends(require_api_key)])
 def retrieve(req: RetrievalRequest):
     """
-    Semantic search + rerank.
+    Hybrid search + rerank.
 
     1. Embed the question with Voyage AI.
-    2. Fetch the TOP_K nearest chunks from Postgres using cosine distance.
-    3. Rerank those candidates with Voyage's reranker.
-    4. Return the top RERANK_TOP_N passages with metadata.
+    2. Full-text search (codes, acronyms, names, titles) and exact vector search.
+    3. Fuse the two rankings, cap chunks per document, then rerank.
+    4. Return the top passages. The response fields are unchanged.
     """
-    final_n = req.top_k or RERANK_TOP_N
-    candidates_n = max(final_n * 4, TOP_K)
+    final_n, candidates_n, pool_n, final_cap, candidate_cap = passage_limits(req.top_k)
+    title_filters = search.title_exclusion_substrings(req.exclude_titles)
+    category_filters = search.clean_strings(req.exclude_categories)
 
     try:
         embed_result = vo.embed(
@@ -368,87 +480,108 @@ def retrieve(req: RetrievalRequest):
         log.error(f"Voyage embed failed: {exc}")
         raise HTTPException(status_code=502, detail=f"Embedding failed: {exc}")
 
-    where_parts  = []
-    filter_params: list = []
-
-    if req.category:
-        where_parts.append("category = %s")
-        filter_params.append(req.category)
-    if req.source:
-        where_parts.append("source = %s")
-        filter_params.append(req.source)
-
-    where_clause = ("WHERE " + " AND ".join(where_parts)) if where_parts else ""
-
-    sql = f"""
-        SELECT
-            document_id,
-            title,
-            category,
-            topic,
-            source,
-            source_url,
-            source_date,
-            is_authoritative,
-            chunk_text,
-            1 - (embedding <=> %s::vector) AS similarity
-        FROM knowledge_chunks
-        {where_clause}
-        ORDER BY embedding <=> %s::vector
-        LIMIT %s
-    """
-    params = [json.dumps(q_vector)] + filter_params + [json.dumps(q_vector), candidates_n]
+    where_sql, filter_params = search.retrieval_where(
+        category=req.category,
+        source=req.source,
+        exclude_titles=req.exclude_titles,
+        exclude_categories=req.exclude_categories,
+    )
+    vector_json = json.dumps(q_vector)
+    vector_sql = search.vector_search_sql(where_sql)
+    vector_params = [vector_json, *filter_params, vector_json, pool_n]
+    plan = search.plan_keyword_query(req.question)
+    keyword_sql, keyword_params = search.keyword_search_sql(
+        where_sql, plan, filter_params, pool_n
+    )
 
     try:
         with get_db() as conn:
             cur = conn.cursor()
-            cur.execute(sql, params)
-            rows = cur.fetchall()
+            keyword_ready = ensure_search_ready(conn)
+            keyword_rows = []
+            if keyword_ready and keyword_sql:
+                # Run this before exact-scan settings. Those settings also
+                # disable the GIN index, and the rows are already in memory
+                # by the time the vector query needs a sequential scan.
+                try:
+                    cur.execute("SAVEPOINT keyword_search")
+                    cur.execute(keyword_sql, keyword_params)
+                    keyword_rows = cur.fetchall()
+                    cur.execute("RELEASE SAVEPOINT keyword_search")
+                except Exception as exc:
+                    log.warning("Keyword search failed (%s); continuing with vectors", exc)
+                    try:
+                        cur.execute("ROLLBACK TO SAVEPOINT keyword_search")
+                        cur.execute("RELEASE SAVEPOINT keyword_search")
+                    except Exception:
+                        log.warning("Could not recover the keyword-search savepoint", exc_info=True)
+            if _env_flag("VECTOR_EXACT_SEARCH", True):
+                search.apply_vector_settings(cur, exact=True)
+            else:
+                search.apply_vector_settings(cur, exact=False)
+            cur.execute(vector_sql, vector_params)
+            vector_rows = cur.fetchall()
     except Exception as exc:
         log.error(f"Postgres query failed: {exc}")
         raise HTTPException(status_code=500, detail=f"Database error: {exc}")
 
-    if not rows:
-        log.info(f"No results for: {req.question!r}")
+    vector_hits = [
+        hit
+        for hit in (search.hit_from_row(row) for row in vector_rows)
+        if _keep_hit(hit, title_filters, category_filters)
+    ]
+    keyword_hits = [
+        hit
+        for hit in (search.hit_from_row(row) for row in keyword_rows)
+        if _keep_hit(hit, title_filters, category_filters)
+    ]
+    merged = search.rrf_merge([vector_hits, keyword_hits])
+    candidates = search.select_with_document_cap(
+        merged,
+        limit=candidates_n,
+        per_document=candidate_cap,
+        floor=final_n,
+    )
+    if not candidates:
+        log.info(
+            "No results for: %r (vector=%s keyword=%s)",
+            req.question[:80],
+            len(vector_hits),
+            len(keyword_hits),
+        )
         return RetrievalResponse(question=req.question, passages=[])
 
-    chunk_texts = [row[8] for row in rows]
-
+    rerank_inputs = [passage_for_model(hit.title, hit.chunk_text) for hit in candidates]
     try:
         rerank_result = vo.rerank(
             req.question,
-            chunk_texts,
+            rerank_inputs,
             model=VOYAGE_RERANK_MODEL,
-            top_k=final_n,
+            top_k=len(candidates),
         )
-        top_results = rerank_result.results
+        ordered: list[search.ChunkHit] = []
+        for result in rerank_result.results:
+            hit = candidates[result.index]
+            hit.score = float(result.relevance_score)
+            ordered.append(hit)
     except Exception as exc:
-        log.warning(f"Reranking failed ({exc}), falling back to similarity order")
-        top_results = [
-            type("R", (), {"index": i, "relevance_score": rows[i][9]})()
-            for i in range(min(final_n, len(rows)))
-        ]
+        log.warning(f"Reranking failed ({exc}), falling back to fused order")
+        ordered = candidates
 
-    passages = []
-    for result in top_results:
-        row = rows[result.index]
-        passages.append(
-            Passage(
-                document_id=      row[0],
-                title=            row[1],
-                category=         row[2],
-                topic=            row[3],
-                source=           row[4],
-                source_url=       row[5],
-                source_date=      row[6],
-                is_authoritative= bool(row[7]),
-                chunk_text=       row[8],
-                relevance_score=  float(result.relevance_score),
-            )
-        )
-
+    final_hits = search.select_with_document_cap(
+        ordered,
+        limit=final_n,
+        per_document=final_cap,
+        floor=final_n,
+    )
+    passages = _passages_from_hits(final_hits)
     log.info(
-        f"Retrieved {len(passages)} passage(s) for: {req.question[:80]!r}"
+        "Retrieved %s passage(s) for %r (vector=%s keyword=%s merged=%s)",
+        len(passages),
+        req.question[:80],
+        len(vector_hits),
+        len(keyword_hits),
+        len(merged),
     )
     return RetrievalResponse(question=req.question, passages=passages)
 

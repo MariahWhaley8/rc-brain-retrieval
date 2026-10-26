@@ -9,4 +9,5 @@ os.environ.setdefault("BASE44_APP_ID", "app-test")
 os.environ["REINDEX_SCHEDULER"] = "false"
 os.environ["REINDEX_ON_STARTUP"] = "false"
 os.environ["REINDEX_INLINE"] = "true"
+os.environ["RETRIEVAL_SCHEMA_ON_START"] = "false"
 os.environ["VOYAGE_MIN_INTERVAL_SECONDS"] = "0"
