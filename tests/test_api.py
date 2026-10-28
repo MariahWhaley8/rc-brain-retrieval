@@ -208,6 +208,8 @@ class RecordingDB:
 
             def fetchall(self):
                 sql = db.statements[-1]
+                if "neighbor_chunks" in sql:
+                    return db.rows_for("neighbor")
                 if "search_tsv" in sql:
                     return db.rows_for("keyword")
                 return db.rows_for("vector")
@@ -412,6 +414,192 @@ def test_single_document_corpus_still_fills_the_requested_count(client, monkeypa
     passages = response.json()["passages"]
     assert len(passages) == 4
     assert {item["document_id"] for item in passages} == {"only"}
+
+
+CHECKLIST = (
+    "1. Inspect the vehicle before the shift starts. "
+    "2. Check the tires, lights, and fuel. "
+    "3. Confirm the route sheet matches the scanner. "
+    "4. Record the odometer. "
+    "5. Repeat this opening checklist every morning before the first stop."
+)
+
+
+def test_retrieve_collapses_drive_copies_and_backfills_unique_passages(client, monkeypatch):
+    rows = []
+    for index in range(1, 9):
+        suffix = f" ({index})" if index < 8 else ""
+        doc_id = "original" if suffix == "" else f"copy-{index}"
+        title = f"Opening Checklist{suffix}"
+        rows.append(_row(doc_id, title, CHECKLIST, chunk_index=4))
+        rows.append(
+            _row(
+                doc_id,
+                title,
+                "After the checklist, fuel every truck before noon.",
+                chunk_index=5,
+            )
+        )
+    for index in range(10):
+        rows.append(
+            _row(
+                f"memo-{index}",
+                f"Memo {index}",
+                f"Distinct memo {index} about a different topic.",
+                chunk_index=0,
+            )
+        )
+
+    def rows_for(kind):
+        if kind == "vector":
+            return rows
+        return []
+
+    RecordingDB(rows_for).install(monkeypatch)
+    response = client.post(
+        "/retrieve",
+        headers=AUTH,
+        json={"question": "opening checklist before the first stop", "top_k": 12},
+    )
+    assert response.status_code == 200
+    passages = response.json()["passages"]
+    texts = [item["chunk_text"] for item in passages]
+    assert len(passages) == 12
+    assert len(set(texts)) == 12
+    assert texts.count(CHECKLIST) == 1
+    checklist = [item for item in passages if item["title"].startswith("Opening Checklist")]
+    assert len(checklist) == 2
+    assert {item["document_id"] for item in checklist} == {"original"}
+
+
+def test_expand_neighbors_includes_the_rest_of_a_split_list(client, monkeypatch):
+    middle = _row(
+        "checklist",
+        "Opening Checklist",
+        "4. Delta 5. Echo 6. Foxtrot",
+        chunk_index=2,
+    )
+    memos = [
+        _row(f"memo-{index}", f"Memo {index}", f"Memo body {index}.", chunk_index=0)
+        for index in range(10)
+    ]
+    neighbors = [
+        _row("checklist", "Opening Checklist", "1. Alpha 2. Bravo 3. Charlie", chunk_index=1),
+        _row("checklist", "Opening Checklist", "7. Golf 8. Hotel 9. India", chunk_index=3),
+    ]
+
+    def rows_for(kind):
+        if kind == "vector":
+            return [middle, *memos]
+        if kind == "neighbor":
+            return neighbors
+        return []
+
+    db = RecordingDB(rows_for).install(monkeypatch)
+    response = client.post(
+        "/retrieve",
+        headers=AUTH,
+        json={"question": "opening checklist numbered steps", "top_k": 8},
+    )
+    texts = [item["chunk_text"] for item in response.json()["passages"]]
+    assert texts[:3] == [
+        "1. Alpha 2. Bravo 3. Charlie",
+        "4. Delta 5. Echo 6. Foxtrot",
+        "7. Golf 8. Hotel 9. India",
+    ]
+    assert len(texts) == 8
+    assert len(set(texts)) == 8
+    assert any("neighbor_chunks" in sql for sql in db.statements)
+
+    db = RecordingDB(rows_for).install(monkeypatch)
+    off = client.post(
+        "/retrieve",
+        headers=AUTH,
+        json={
+            "question": "opening checklist numbered steps",
+            "top_k": 8,
+            "expand_neighbors": False,
+        },
+    )
+    off_texts = [item["chunk_text"] for item in off.json()["passages"]]
+    assert off_texts[0] == "4. Delta 5. Echo 6. Foxtrot"
+    assert "1. Alpha 2. Bravo 3. Charlie" not in off_texts
+    assert not any("neighbor_chunks" in sql for sql in db.statements)
+
+
+def test_duplicate_chunk_endpoint_is_report_only_until_apply(client, monkeypatch):
+    class Cur:
+        def __init__(self):
+            self.statements = []
+            self.rowcount = 2
+
+        def execute(self, sql, params=None):
+            self.statements.append(sql)
+
+        def fetchall(self):
+            sql = self.statements[-1]
+            if "duplicate_identical" in sql:
+                return [("doc-1", "Notes (1)", 0, 3, "alpha passage")]
+            if "duplicate_cross_doc" in sql:
+                return [(8, 8, "alpha passage", ["Notes", "Notes (1)"])]
+            return []
+
+    class Conn:
+        def __init__(self):
+            self.cur = Cur()
+            self.committed = False
+            self.rolled_back = False
+
+        def cursor(self):
+            return self.cur
+
+        def commit(self):
+            self.committed = True
+
+        def rollback(self):
+            self.rolled_back = True
+
+        def close(self):
+            return None
+
+    holder = {}
+
+    @contextmanager
+    def fake_db():
+        conn = Conn()
+        holder["conn"] = conn
+        yield conn
+
+    monkeypatch.setattr(api, "get_db", fake_db)
+    denied = client.get("/maintenance/duplicate-chunks")
+    assert denied.status_code == 401
+
+    report = client.get("/maintenance/duplicate-chunks", headers=AUTH)
+    assert report.status_code == 200
+    body = report.json()
+    assert body["mode"] == "report"
+    assert body["deleted"] == 0
+    assert body["extra_identical_rows"] == 2
+    assert body["cross_document_text_groups"] == 1
+    assert holder["conn"].rolled_back is True
+    assert holder["conn"].committed is False
+    assert not any("duplicate_delete" in sql for sql in holder["conn"].cur.statements)
+
+    empty = client.post("/maintenance/duplicate-chunks", headers=AUTH)
+    assert empty.status_code == 200
+    assert empty.json()["mode"] == "report"
+    assert holder["conn"].committed is False
+
+    applied = client.post(
+        "/maintenance/duplicate-chunks",
+        headers=AUTH,
+        json={"apply": True},
+    )
+    assert applied.status_code == 200
+    assert applied.json()["deleted"] == 2
+    assert applied.json()["mode"] == "deleted"
+    assert holder["conn"].committed is True
+    assert any("duplicate_delete" in sql for sql in holder["conn"].cur.statements)
 
 
 def test_health_shape(client, monkeypatch):

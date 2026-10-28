@@ -30,14 +30,16 @@ The next reindex after this change re-embeds every document once, because `embed
 
 ## Retrieval
 
-`POST /retrieve` still takes `question`, and optionally `top_k`, `category`, and `source`. Two optional filters were added:
+`POST /retrieve` still takes `question`, and optionally `top_k`, `category`, `source`, and `expand_neighbors` (defaults to on). Two optional filters were added:
 
 - `exclude_titles`: title substrings to drop, as a list or a single string. Matched case-insensitively, in addition to the built-in exclusion.
 - `exclude_categories`: category values to drop, matched exactly.
 
 Titles containing `RC Brain Agent Evaluation Q&A` are always excluded. Set `RETRIEVAL_EXCLUDE_TITLES` to more substrings separated by `||` when another set of docs should stay out of answers. The built-in eval-key exclusion stays on either way.
 
-When the caller omits `top_k`, the response has 8 passages (`RERANK_TOP_N`). A caller that sends `top_k` gets that many, up to 100. Each leg reads a wider pool (at least 80 rows, and at least three times the candidate count). Fusion keeps up to 40 candidates (`TOP_K`) with at most 4 chunks from one document, the reranker orders those, and the response keeps at most 2 chunks from one document (`MAX_CHUNKS_PER_DOCUMENT`). If the cap would leave the answer short of the requested count, later chunks from those same documents fill the rest, so a question that only matches one transcript still returns a full set.
+When the caller omits `top_k`, the response has 8 passages (`RERANK_TOP_N`). A caller that sends `top_k` gets that many, up to 100. Each leg reads a wider pool (at least 80 rows, and at least three times the candidate count). Before that pool is cut off, each leg keeps at most 4 chunks from one document and one row per exact passage text, so duplicate Drive copies cannot fill the limit. Fusion then collapses identical and near-identical passages across documents. A title ending in `(1)` or `(2)` shares the per-document cap with the unsuffixed file, and the unsuffixed file is the one returned when the text matches. The reranker orders up to 40 of those candidates (`TOP_K`). The response keeps at most 2 chunks from one document (`MAX_CHUNKS_PER_DOCUMENT`). Slots opened by dropping a duplicate are filled from the next distinct passage. If that still leaves the answer short of the requested count, later distinct chunks from those same documents fill the rest, so a question that only matches one transcript still returns a full set.
+
+`expand_neighbors` defaults to on. Set it to `false` on the request, or set `EXPAND_NEIGHBORS=false`, to turn it off. When it is on, one extra lookup loads the chunks immediately before and after the passages already chosen from the top documents, and splices them in beside the chunk they continue. That is what keeps a numbered list together after it has been split at a chunk boundary. The response stays at `top_k`; lower-ranked passages make room. Small requests (`top_k` under 4) are not expanded. The neighbor lookup does not call Voyage again.
 
 The vector leg is an exact nearest-neighbor scan. `SET LOCAL enable_indexscan = off` and `SET LOCAL enable_bitmapscan = off` run on that query so an IVFFlat or HNSW index created outside this repo cannot return fewer rows than it should. At about 9,000 chunks the sequential scan is the right trade. `ivfflat.probes` and `hnsw.ef_search` are also raised, which covers a planner that still chooses the index. Set `VECTOR_EXACT_SEARCH=false` to leave index scans enabled. The ANN index is not dropped.
 
@@ -79,6 +81,33 @@ curl -sS "https://<railway-domain>/reindex/status" \
 
 `python indexer.py` and `python indexer.py --force` still work for a local run. Do not use that command as the Railway start command.
 
+## Duplicate chunk rows
+
+Retrieval already hides duplicate passage text. Exact duplicate rows in Postgres (the same `document_id`, `chunk_index`, and `chunk_text` stored more than once) can also be reported, and removed, without a reindex.
+
+Both calls use the same API key as `/retrieve`. The default is report-only. Nothing is deleted unless `apply` is true.
+
+```bash
+curl -sS "https://<railway-domain>/maintenance/duplicate-chunks" \
+  -H "X-API-Key: $RETRIEVAL_API_KEY"
+```
+
+```bash
+curl -sS -X POST "https://<railway-domain>/maintenance/duplicate-chunks" \
+  -H "X-API-Key: $RETRIEVAL_API_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{"apply": true}'
+```
+
+An empty POST body is still report-only. `apply: true` deletes the extra physical rows and keeps one. The same text under two document ids (a Drive copy indexed as its own file) is listed under `cross_document_preview` and left in the table, because the next reindex would insert it again. Repeated paragraphs at two chunk indexes of one document are listed and left in place for the same reason.
+
+The same report runs locally, still report-only unless the delete flag is present:
+
+```bash
+python indexer.py --report-duplicate-chunks
+python indexer.py --delete-duplicate-chunks
+```
+
 ## What to change in Railway
 
 Auto-deploy from `main` updates the web service. These are the only hand edits:
@@ -108,8 +137,9 @@ Optional variables, all with defaults:
 | `REINDEX_ON_STARTUP` | on | Catch up when the last finished run is missing or older than 8 days |
 | `TOP_K` | `40` | Candidates kept after fusion, before reranking |
 | `RERANK_TOP_N` | `8` | Passages returned when the request omits `top_k` |
-| `MAX_CHUNKS_PER_DOCUMENT` | `2` | Final cap per document. `0` disables it |
-| `CANDIDATE_CHUNKS_PER_DOCUMENT` | `4` | Cap per document in the rerank set |
+| `MAX_CHUNKS_PER_DOCUMENT` | `2` | Final cap per document. Drive copies of one title share it. `0` disables it |
+| `CANDIDATE_CHUNKS_PER_DOCUMENT` | `4` | Cap per document in the rerank set and in each search leg |
+| `EXPAND_NEIGHBORS` | on | Splice adjacent chunks of the top documents. `false` turns it off |
 | `VECTOR_EXACT_SEARCH` | on | Exact vector scan. `false` leaves ANN index scans on |
 | `RETRIEVAL_EXCLUDE_TITLES` | empty | Extra title substrings to drop, separated by `\|\|` |
 | `RETRIEVAL_SCHEMA_ON_START` | on | Additive full-text migration at boot |
@@ -121,4 +151,4 @@ pip install -r requirements.txt -r requirements-dev.txt
 pytest
 ```
 
-The tests cover cursor pagination (no `skip`, every page, no wipe on a partial walk), Voyage batching and retries, incremental skips, deletion of documents removed in Base44, the Monday trigger, the API key on `/reindex`, the `/retrieve` response shape, hybrid fusion, the per-document cap, eval-key exclusion, and the title prefix on embeddings.
+The tests cover cursor pagination (no `skip`, every page, no wipe on a partial walk), Voyage batching and retries, incremental skips, deletion of documents removed in Base44, the Monday trigger, the API key on `/reindex`, the `/retrieve` response shape, hybrid fusion, the per-document cap, duplicate Drive copies (the same chunk filling 8 of 12 slots, then one slot plus distinct backfill), adjacent chunks for a split numbered list, the report-only duplicate-chunk endpoint, eval-key exclusion, and the title prefix on embeddings.

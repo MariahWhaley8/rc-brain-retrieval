@@ -57,6 +57,8 @@ import requests
 import voyageai
 from dotenv import load_dotenv
 
+import search
+
 load_dotenv()
 
 logging.basicConfig(
@@ -1415,7 +1417,36 @@ def index_documents(
             _release_lock(lock_conn, lock_cur)
 
 
+def report_duplicate_chunks(apply: bool = False, connect: Callable | None = None) -> dict:
+    """
+    Report exact duplicate chunk rows. Delete them only when apply is true.
+
+    Same rules as POST /maintenance/duplicate-chunks. The default is report-only.
+    """
+    connect = connect or default_connect
+    conn = connect()
+    try:
+        cur = conn.cursor()
+        result = search.collect_duplicate_chunks(cur, apply=apply)
+        if apply:
+            conn.commit()
+        else:
+            conn.rollback()
+        return result
+    finally:
+        conn.close()
+
+
 if __name__ == "__main__":
+    if "--report-duplicate-chunks" in sys.argv or "--delete-duplicate-chunks" in sys.argv:
+        deleting = "--delete-duplicate-chunks" in sys.argv
+        try:
+            report = report_duplicate_chunks(apply=deleting)
+        except Exception:
+            log.exception("Duplicate-chunk maintenance failed")
+            sys.exit(1)
+        print(json.dumps(report, default=str, indent=2))
+        sys.exit(0)
     force = "--force" in sys.argv
     if force:
         log.info("Force mode: re-embedding every document.")

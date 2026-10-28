@@ -8,15 +8,20 @@ Base44 calls POST /retrieve with the user's question.
 The API returns the top passages from the knowledge store, ready to pass to Claude.
 
 Search is hybrid. A full-text leg (Postgres `simple` tsvector) and an exact
-vector leg are merged with reciprocal rank fusion, then Voyage reranks the
-merged candidates. Titles containing "RC Brain Agent Evaluation Q&A" are
-always left out.
+vector leg are merged with reciprocal rank fusion. Identical and near-identical
+passages are collapsed, including duplicate Drive copies, then Voyage reranks
+what remains. A per-document cap runs after that collapse. Titles containing
+"RC Brain Agent Evaluation Q&A" are always left out.
 
 Endpoints:
     GET  /health           — liveness check; returns chunk count
     POST /retrieve         — hybrid search + rerank; returns top passages
     POST /reindex          — start an incremental reindex in the background
     GET  /reindex/status   — progress of the latest reindex
+    GET  /maintenance/duplicate-chunks
+                           — report exact duplicate chunk rows (no deletes)
+    POST /maintenance/duplicate-chunks
+                           — same report; {"apply": true} deletes those rows
 
 Environment variables (set in Railway):
     DATABASE_URL        - PostgreSQL connection string (from Railway)
@@ -28,8 +33,10 @@ Environment variables (set in Railway):
     RERANK_TOP_N        - Final passages when the request omits top_k (default: 8)
     MAX_CHUNKS_PER_DOCUMENT
                         - Final cap per document (default: 2). 0 disables it.
+                          Drive copies that share a base title count as one document.
     CANDIDATE_CHUNKS_PER_DOCUMENT
                         - Cap per document in the rerank candidate set (default: 4)
+    EXPAND_NEIGHBORS    - "false" disables adjacent-chunk expansion (default: on)
     VECTOR_EXACT_SEARCH - "false" leaves ANN index scans on (default: exact scan)
     RETRIEVAL_EXCLUDE_TITLES
                         - Extra title substrings to drop, separated by "||"
@@ -375,6 +382,9 @@ class RetrievalRequest(BaseModel):
     exclude_titles: Optional[list[str]] = None
     # Exact category values to leave out of the result.
     exclude_categories: Optional[list[str]] = None
+    # Adjacent chunks of the top documents. None follows EXPAND_NEIGHBORS,
+    # which defaults to on, so a numbered list split across chunks stays together.
+    expand_neighbors: Optional[bool] = None
 
     @field_validator("exclude_titles", "exclude_categories", mode="before")
     @classmethod
@@ -427,6 +437,33 @@ def health():
         raise HTTPException(status_code=500, detail=str(exc))
 
 
+def _expand_enabled(requested: Optional[bool]) -> bool:
+    if requested is not None:
+        return bool(requested)
+    return _env_flag("EXPAND_NEIGHBORS", True)
+
+
+def _apply_flag(payload: Optional[dict]) -> bool:
+    """True only for an explicit apply. Anything else stays report-only."""
+    if not isinstance(payload, dict) or "apply" not in payload:
+        return False
+    value = payload.get("apply")
+    if isinstance(value, str):
+        return value.strip().lower() in {"1", "true", "yes", "y", "on"}
+    return value is True
+
+
+def _duplicate_chunk_body(apply: bool) -> dict:
+    with get_db() as conn:
+        cur = conn.cursor()
+        body = search.collect_duplicate_chunks(cur, apply=apply)
+        if apply:
+            conn.commit()
+        else:
+            conn.rollback()
+        return body
+
+
 def _keep_hit(hit: search.ChunkHit, titles: list[str], categories: list[str]) -> bool:
     if search.title_is_excluded(hit.title, titles):
         return False
@@ -462,8 +499,12 @@ def retrieve(req: RetrievalRequest):
 
     1. Embed the question with Voyage AI.
     2. Full-text search (codes, acronyms, names, titles) and exact vector search.
-    3. Fuse the two rankings, cap chunks per document, then rerank.
-    4. Return the top passages. The response fields are unchanged.
+       Each leg keeps a few chunks per document and one row per exact passage.
+    3. Fuse the rankings, collapse near-duplicate text, cap chunks per document,
+       then rerank. The cap counts Drive copies of one title as one document.
+    4. Backfill open slots with the next distinct passages. When expand_neighbors
+       is on, splice in adjacent chunks of the top documents.
+    5. Return the top passages. The response fields are unchanged.
     """
     final_n, candidates_n, pool_n, final_cap, candidate_cap = passage_limits(req.top_k)
     title_filters = search.title_exclusion_substrings(req.exclude_titles)
@@ -488,10 +529,19 @@ def retrieve(req: RetrievalRequest):
     )
     vector_json = json.dumps(q_vector)
     vector_sql = search.vector_search_sql(where_sql)
-    vector_params = [vector_json, *filter_params, vector_json, pool_n]
+    vector_params = [
+        vector_json,
+        *filter_params,
+        search.doc_cap_param(candidate_cap),
+        pool_n,
+    ]
     plan = search.plan_keyword_query(req.question)
     keyword_sql, keyword_params = search.keyword_search_sql(
-        where_sql, plan, filter_params, pool_n
+        where_sql,
+        plan,
+        filter_params,
+        pool_n,
+        per_document=candidate_cap,
     )
 
     try:
@@ -536,11 +586,14 @@ def retrieve(req: RetrievalRequest):
         if _keep_hit(hit, title_filters, category_filters)
     ]
     merged = search.rrf_merge([vector_hits, keyword_hits])
+    collapsed = search.collapse_similar_passages(merged)
+    group_key = search.make_group_key(collapsed)
     candidates = search.select_with_document_cap(
-        merged,
+        collapsed,
         limit=candidates_n,
         per_document=candidate_cap,
         floor=final_n,
+        group_key=group_key,
     )
     if not candidates:
         log.info(
@@ -568,20 +621,51 @@ def retrieve(req: RetrievalRequest):
         log.warning(f"Reranking failed ({exc}), falling back to fused order")
         ordered = candidates
 
+    ordered = search.collapse_similar_passages(ordered)
+    group_key = search.make_group_key(ordered)
     final_hits = search.select_with_document_cap(
         ordered,
         limit=final_n,
         per_document=final_cap,
         floor=final_n,
+        group_key=group_key,
     )
+    expand = _expand_enabled(req.expand_neighbors)
+    budget = search.neighbor_budget(final_n)
+    if expand and budget and final_hits:
+        doc_ids = search.top_document_ids(final_hits, search.DEFAULT_NEIGHBOR_DOCS)
+        pairs = search.neighbor_pairs(final_hits, doc_ids)
+        if pairs:
+            try:
+                with get_db() as conn:
+                    cur = conn.cursor()
+                    cur.execute(search.neighbor_sql(), (tuple(pairs),))
+                    neighbor_rows = cur.fetchall()
+            except Exception as exc:
+                log.warning("Neighbor lookup failed (%s); returning the capped list", exc)
+                neighbor_rows = []
+            neighbors = [
+                hit
+                for hit in (search.hit_from_row(row) for row in neighbor_rows)
+                if _keep_hit(hit, title_filters, category_filters)
+            ]
+            if neighbors:
+                final_hits = search.splice_neighbors(
+                    final_hits,
+                    neighbors,
+                    limit=final_n,
+                    expand_doc_ids=doc_ids,
+                    max_neighbors=budget,
+                )
     passages = _passages_from_hits(final_hits)
     log.info(
-        "Retrieved %s passage(s) for %r (vector=%s keyword=%s merged=%s)",
+        "Retrieved %s passage(s) for %r (vector=%s keyword=%s merged=%s unique=%s)",
         len(passages),
         req.question[:80],
         len(vector_hits),
         len(keyword_hits),
         len(merged),
+        len(collapsed),
     )
     return RetrievalResponse(question=req.question, passages=passages)
 
@@ -610,6 +694,37 @@ def reindex(payload: Optional[dict[str, Any]] = Body(default=None)):
 def reindex_status_endpoint():
     """In-memory progress of this process, plus the last finished run when idle."""
     return reindex_status()
+
+
+@app.get("/maintenance/duplicate-chunks", dependencies=[Depends(require_api_key)])
+def duplicate_chunks_report():
+    """
+    Report exact duplicate chunk rows. Does not delete anything.
+
+    Same API key as /retrieve. Cross-document Drive copies are listed and left
+    in the table; retrieval already collapses them.
+    """
+    try:
+        return _duplicate_chunk_body(False)
+    except Exception as exc:
+        log.error("Duplicate-chunk report failed: %s", exc)
+        raise HTTPException(status_code=500, detail=f"Database error: {exc}")
+
+
+@app.post("/maintenance/duplicate-chunks", dependencies=[Depends(require_api_key)])
+def duplicate_chunks_apply(payload: Optional[dict[str, Any]] = Body(default=None)):
+    """
+    Report exact duplicate chunk rows. Send {"apply": true} to delete the extras.
+
+    An empty body, or any payload that does not set apply to true, is report-only.
+    One row is kept for each (document_id, chunk_index, chunk_text).
+    """
+    apply = _apply_flag(payload)
+    try:
+        return _duplicate_chunk_body(apply)
+    except Exception as exc:
+        log.error("Duplicate-chunk maintenance failed: %s", exc)
+        raise HTTPException(status_code=500, detail=f"Database error: {exc}")
 
 
 if __name__ == "__main__":
