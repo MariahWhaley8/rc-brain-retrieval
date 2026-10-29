@@ -27,16 +27,17 @@ BUILTIN_TITLE_EXCLUSION = "RC Brain Agent Evaluation Q&A"
 
 RRF_K = 60
 
-# Planner settings that force a sequential scan. An IVFFlat or HNSW index
-# built outside this repo can return fewer rows than LIMIT (including zero)
-# when probes / ef_search are low. About 9,000 chunks is small enough that
-# an exact scan is the reliable choice.
+# Planner settings that force a sequential scan. Used when the caller asks
+# for the old exact path, when VECTOR_EXACT_SEARCH is on, and while the HNSW
+# index is still building. With index scans disabled the query computes cosine
+# distance for every chunk, which is the pre-index result set.
 EXACT_SCAN_SETTINGS = (
     "SET LOCAL enable_indexscan = off",
     "SET LOCAL enable_bitmapscan = off",
 )
-# Applied even when the planner still picks an ANN index. Unknown GUCs
-# (older pgvector builds) are skipped per session.
+# Applied on both paths. Unknown GUCs (older pgvector builds) are skipped
+# per session. ef_search below is a floor; the ANN path raises it to at least
+# the candidate LIMIT so pgvector does not truncate the neighbor list.
 BROAD_ANN_SETTINGS = (
     "SET LOCAL ivfflat.probes = 1000",
     "SET LOCAL hnsw.ef_search = 1000",
@@ -45,6 +46,47 @@ BROAD_ANN_SETTINGS = (
     "SET LOCAL hnsw.max_scan_tuples = 20000",
     "SET LOCAL ivfflat.max_probes = 1000",
 )
+
+# Background startup runs this once, with autocommit, outside any transaction.
+# CONCURRENTLY does not lock out reads or writes. IF NOT EXISTS makes a second
+# boot a no-op. Nothing here drops or rewrites rows.
+HNSW_INDEX_NAME = "knowledge_chunks_embedding_hnsw"
+HNSW_INDEX_SQL = f"""
+CREATE INDEX CONCURRENTLY IF NOT EXISTS {HNSW_INDEX_NAME}
+    ON knowledge_chunks USING hnsw (embedding vector_cosine_ops)
+    WITH (m = 16, ef_construction = 64)
+"""
+# Valid cosine HNSW named by this process, on knowledge_chunks.embedding.
+# int2vector / oidvector are subscripted from 0; ANY() does not accept them.
+# A partial index, an L2 index, or an invalid build does not count.
+HNSW_READY_SQL = f"""
+SELECT EXISTS (
+    SELECT 1
+    FROM pg_index i
+    JOIN pg_class idx ON idx.oid = i.indexrelid
+    JOIN pg_am am ON am.oid = idx.relam
+    JOIN pg_opclass opc ON opc.oid = i.indclass[0]
+    JOIN pg_attribute att
+        ON att.attrelid = i.indrelid
+       AND att.attnum = i.indkey[0]
+       AND NOT att.attisdropped
+       AND att.attname = 'embedding'
+    WHERE i.indrelid = 'knowledge_chunks'::regclass
+      AND idx.relname = '{HNSW_INDEX_NAME}'
+      AND am.amname = 'hnsw'
+      AND opc.opcname = 'vector_cosine_ops'
+      AND i.indisvalid
+      AND i.indisready
+      AND i.indpred IS NULL
+)
+"""
+HNSW_STATE_SQL = f"""
+SELECT i.indisvalid, i.indisready
+FROM pg_index i
+JOIN pg_class idx ON idx.oid = i.indexrelid
+WHERE i.indrelid = 'knowledge_chunks'::regclass
+  AND idx.relname = '{HNSW_INDEX_NAME}'
+"""
 
 HIT_COLUMNS = """
     document_id,
@@ -362,16 +404,75 @@ def _diversify(inner_sql: str) -> str:
     """
 
 
-def vector_search_sql(where_sql: str) -> str:
+def ann_candidate_limit(pool_n: int) -> int:
+    """
+    Nearest chunks to read before the per-document window.
+
+    The diversified pool is at most a few hundred rows. This limit sits above
+    that so the per-document cap and exact-text dedupe can still fill it.
+    hnsw.ef_search is raised to at least this value on the ANN path.
+    """
+    raw = os.environ.get("ANN_CANDIDATES", "1000")
+    try:
+        configured = int(raw)
+    except (TypeError, ValueError):
+        configured = 1000
+    if configured < 1:
+        configured = 1000
+    return max(configured, int(pool_n))
+
+
+def vector_search_sql(where_sql: str, *, ann_limit: int | None = None) -> str:
+    """
+    Vector leg. `ann_limit` None is the exact scan (no inner LIMIT).
+
+    An HNSW index is only considered when the inner query orders by the cosine
+    distance and limits the rows. The window functions stay outside that scan
+    so they diversify the same way as the exact path.
+    """
     where = f"WHERE {where_sql}" if where_sql else ""
+    if ann_limit is None:
+        inner = f"""
+            /* vector_exact */
+            SELECT
+                {HIT_COLUMNS},
+                1 - (embedding <=> %s::vector) AS score
+            FROM knowledge_chunks
+            {where}
+        """
+        return _diversify(inner)
     inner = f"""
+        /* vector_ann */
         SELECT
             {HIT_COLUMNS},
             1 - (embedding <=> %s::vector) AS score
         FROM knowledge_chunks
         {where}
+        ORDER BY embedding <=> %s::vector
+        LIMIT %s
     """
     return _diversify(inner)
+
+
+def vector_search_params(
+    vector_json: str,
+    filter_params: list,
+    per_document: int,
+    limit: int,
+    *,
+    ann_limit: int | None = None,
+) -> list:
+    """Bind values in the same order as the `%s` placeholders in vector_search_sql."""
+    if ann_limit is None:
+        return [vector_json, *filter_params, doc_cap_param(per_document), limit]
+    return [
+        vector_json,
+        *filter_params,
+        vector_json,
+        int(ann_limit),
+        doc_cap_param(per_document),
+        limit,
+    ]
 
 
 def keyword_search_sql(
@@ -964,16 +1065,23 @@ def _set_local(cur, statement: str) -> None:
     cur.execute("RELEASE SAVEPOINT retrieval_guc")
 
 
-def apply_vector_settings(cur, exact: bool = True) -> None:
+def apply_vector_settings(cur, exact: bool = True, *, ef_search: int | None = None) -> None:
     """
-    Make the following vector query return a full exact neighbor list.
+    Session settings for the vector query that follows.
 
-    Keyword search should run before this. Disabling index scans also keeps
-    the full-text GIN index from being used, which is fine at this table size
-    but pointless for a query that has already finished.
+    Keyword search should run before the exact path. Disabling index scans
+    also keeps the full-text GIN index from being used.
+
+    On the ANN path, hnsw.ef_search is at least 1000 and at least the inner
+    LIMIT. A smaller ef_search makes pgvector return fewer neighbors than the
+    LIMIT asked for, which is the recall failure this setting is there to avoid.
     """
     if exact:
         for statement in EXACT_SCAN_SETTINGS:
             _set_local(cur, statement)
     for statement in BROAD_ANN_SETTINGS:
         _set_local(cur, statement)
+    if exact:
+        return
+    target = 1000 if ef_search is None else max(int(ef_search), 1000)
+    _set_local(cur, f"SET LOCAL hnsw.ef_search = {target}")

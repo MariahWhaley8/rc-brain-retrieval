@@ -24,13 +24,13 @@ It does **not** drop `knowledge_chunks` or `indexed_documents`.
 - Refuses to delete anything if Base44 returns an empty catalog or the walk stops early. A partial failure cannot wipe the index.
 - Commits each document on its own, so a Voyage or database error on one document leaves the others in place.
 
-`POST /retrieve` still returns the same JSON. Each passage has `document_id`, `title`, `category`, `topic`, `source`, `source_url`, `source_date`, `is_authoritative`, `chunk_text`, and `relevance_score`. `chunk_text` is still the passage itself. `source_date` is filled in when a document is revisited; it used to be selected and always null. How those passages are chosen is described under [Retrieval](#retrieval).
+Each passage still has `document_id`, `title`, `category`, `topic`, `source`, `source_url`, `source_date`, `is_authoritative`, `chunk_text`, and `relevance_score`. `chunk_text` is still the passage itself. `source_date` is filled in when a document is revisited; it used to be selected and always null. The response also includes `timings_ms` (embed, keyword, vector search, rerank, neighbors, and total). How those passages are chosen is described under [Retrieval](#retrieval).
 
 The next reindex after this change re-embeds every document once, because `embed_version` is null on existing rows. Later Monday runs download a body only when `updated_date` moved, and call Voyage only when the body, the title, or the embed version requires it.
 
 ## Retrieval
 
-`POST /retrieve` still takes `question`, and optionally `top_k`, `category`, `source`, and `expand_neighbors` (defaults to on). Two optional filters were added:
+`POST /retrieve` takes `question`, and optionally `top_k`, `category`, `source`, `expand_neighbors` (defaults to on), and `exact_search`. Two optional filters were added:
 
 - `exclude_titles`: title substrings to drop, as a list or a single string. Matched case-insensitively, in addition to the built-in exclusion.
 - `exclude_categories`: category values to drop, matched exactly.
@@ -41,7 +41,11 @@ When the caller omits `top_k`, the response has 8 passages (`RERANK_TOP_N`). A c
 
 `expand_neighbors` defaults to on. Set it to `false` on the request, or set `EXPAND_NEIGHBORS=false`, to turn it off. When it is on, one extra lookup loads the chunks immediately before and after the passages already chosen from the top documents, and splices them in beside the chunk they continue. That is what keeps a numbered list together after it has been split at a chunk boundary. The response stays at `top_k`; lower-ranked passages make room. Small requests (`top_k` under 4) are not expanded. The neighbor lookup does not call Voyage again.
 
-The vector leg is an exact nearest-neighbor scan. `SET LOCAL enable_indexscan = off` and `SET LOCAL enable_bitmapscan = off` run on that query so an IVFFlat or HNSW index created outside this repo cannot return fewer rows than it should. At about 9,000 chunks the sequential scan is the right trade. `ivfflat.probes` and `hnsw.ef_search` are also raised, which covers a planner that still chooses the index. Set `VECTOR_EXACT_SEARCH=false` to leave index scans enabled. The ANN index is not dropped.
+The vector leg uses a cosine HNSW index on `knowledge_chunks.embedding` once that index is valid. Startup creates it in the background with `CREATE INDEX CONCURRENTLY IF NOT EXISTS`, so a long build does not block `/health` and does not lock out reads or writes. Until the index is valid, the leg is the original exact scan (`enable_indexscan` and `enable_bitmapscan` off). Send `{"exact_search": true}` to force that exact scan for one request after the index is ready. Set `VECTOR_EXACT_SEARCH=true` to force it for every request. The index is not dropped in either case.
+
+On the indexed path the inner query is `ORDER BY embedding <=>` with a limit (`ANN_CANDIDATES`, default 1000, and never below the diversified pool). `hnsw.ef_search` is raised to at least 1000 and at least that limit, and `hnsw.iterative_scan` is `relaxed_order`, so the reranker still sees the same candidate pool. The per-document caps, dedupe, and `expand_neighbors` behavior are unchanged.
+
+Query embeddings are cached in memory (default 2048 entries, one hour). A repeated question skips Voyage. Postgres connections come from a pool (default 8); the index build uses its own connection so it does not hold a pooled one. `GET /health` includes `vector_index`: `pending` while the build has not been confirmed, `ready` after it has. `/retrieve` logs the same `timings_ms` object it returns.
 
 The keyword leg uses a `simple` tsvector on the title, topic, and passage (`knowledge_chunks.search_tsv`, weight A on the title and topic). Terms are OR'd, alphabetic words are prefix-matched so `RGU` hits `RGUs`, and codes, acronyms, and ids such as `02`, `RGU`, and `MGB-020` get an exact-token bonus. A keyword hit is still returned when the vector leg comes back empty. The two rankings are merged with reciprocal rank fusion before the reranker runs. The reranker sees `Title: <title>` followed by the passage. The JSON `chunk_text` does not include that prefix.
 
@@ -140,7 +144,14 @@ Optional variables, all with defaults:
 | `MAX_CHUNKS_PER_DOCUMENT` | `2` | Final cap per document. Drive copies of one title share it. `0` disables it |
 | `CANDIDATE_CHUNKS_PER_DOCUMENT` | `4` | Cap per document in the rerank set and in each search leg |
 | `EXPAND_NEIGHBORS` | on | Splice adjacent chunks of the top documents. `false` turns it off |
-| `VECTOR_EXACT_SEARCH` | on | Exact vector scan. `false` leaves ANN index scans on |
+| `VECTOR_EXACT_SEARCH` | off | `true` forces the exact vector scan for every request. Rollback switch. The index is left in place |
+| `ANN_CANDIDATES` | `1000` | Nearest chunks read before the per-document window. `hnsw.ef_search` is at least this |
+| `ANN_INDEX_ON_START` | on | Background `CREATE INDEX CONCURRENTLY` for the HNSW index. `false` skips the build |
+| `DB_POOL_MAX` | `8` | Pooled Postgres connections |
+| `DB_POOL_MIN` | `1` | Connections opened when the pool is created |
+| `QUERY_EMBED_CACHE_SIZE` | `2048` | Cached query embeddings. `0` disables the cache |
+| `QUERY_EMBED_CACHE_TTL_SECONDS` | `3600` | How long a cached query embedding is kept. `0` disables the cache |
+| `HNSW_MAINTENANCE_WORK_MEM` | unset | Optional `maintenance_work_mem` for the index-build session only, such as `512MB`. Anything that is not a plain size is ignored |
 | `RETRIEVAL_EXCLUDE_TITLES` | empty | Extra title substrings to drop, separated by `\|\|` |
 | `RETRIEVAL_SCHEMA_ON_START` | on | Additive full-text migration at boot |
 
@@ -151,4 +162,4 @@ pip install -r requirements.txt -r requirements-dev.txt
 pytest
 ```
 
-The tests cover cursor pagination (no `skip`, every page, no wipe on a partial walk), Voyage batching and retries, incremental skips, deletion of documents removed in Base44, the Monday trigger, the API key on `/reindex`, the `/retrieve` response shape, hybrid fusion, the per-document cap, duplicate Drive copies (the same chunk filling 8 of 12 slots, then one slot plus distinct backfill), adjacent chunks for a split numbered list, the report-only duplicate-chunk endpoint, eval-key exclusion, and the title prefix on embeddings.
+The tests cover cursor pagination (no `skip`, every page, no wipe on a partial walk), Voyage batching and retries, incremental skips, deletion of documents removed in Base44, the Monday trigger, the API key on `/reindex`, the `/retrieve` response shape and stage timings, the HNSW path and the exact-search fallback, the connection pool, the query-embedding cache, hybrid fusion, the per-document cap, duplicate Drive copies (the same chunk filling 8 of 12 slots, then one slot plus distinct backfill), adjacent chunks for a split numbered list, the report-only duplicate-chunk endpoint, eval-key exclusion, and the title prefix on embeddings.
