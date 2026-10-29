@@ -5,6 +5,10 @@ from indexer import chunk_text, passage_for_model
 from search import (
     BUILTIN_TITLE_EXCLUSION,
     ChunkHit,
+    HNSW_INDEX_SQL,
+    HNSW_READY_SQL,
+    HNSW_STATE_SQL,
+    ann_candidate_limit,
     apply_vector_settings,
     canonical_title,
     collapse_similar_passages,
@@ -20,6 +24,7 @@ from search import (
     splice_neighbors,
     title_exclusion_substrings,
     title_is_excluded,
+    vector_search_params,
     vector_search_sql,
 )
 
@@ -99,11 +104,13 @@ def test_keyword_and_vector_sql_keep_their_placeholders_aligned():
 
     vector = vector_search_sql(where)
     assert vector.count("%s") == 1 + where.count("%s") + 2
-    assert "embedding <=>" in vector
+    assert vector.count("embedding <=>") == 1
+    assert "ORDER BY embedding" not in vector
+    assert "vector_exact" in vector
     assert "text_rank = 1" in vector
     assert "doc_rank <=" in vector
     assert vector.index("doc_rank <=") < vector.index("text_rank = 1") < vector.index("LIMIT %s")
-    assert "LIMIT %s" in vector
+    assert vector.lower().count("limit %s") == 1
     lowered = vector.lower()
     assert "similarity >" not in lowered
     assert "embedding >" not in lowered
@@ -343,3 +350,83 @@ def test_exact_scan_settings_survive_an_unknown_guc():
     assert "SET LOCAL hnsw.ef_search = 1000" in text
     assert "ROLLBACK TO SAVEPOINT retrieval_guc" in text
     assert "SET LOCAL ivfflat.probes = 1000" in text
+
+
+def test_ann_vector_sql_orders_by_distance_inside_a_limit():
+    where, filters = retrieval_where(
+        category="hr",
+        source=None,
+        exclude_titles=None,
+        exclude_categories=None,
+    )
+    sql = vector_search_sql(where, ann_limit=1000)
+    params = vector_search_params("[1]", filters, 4, 80, ann_limit=1000)
+    compact = " ".join(sql.split())
+    assert "vector_ann" in compact
+    assert compact.count("embedding <=>") == 2
+    assert "ORDER BY embedding <=> %s::vector" in compact
+    assert sql.count("%s") == len(params)
+    assert params[-4] == "[1]"
+    assert params[-3] == 1000
+    assert params[-1] == 80
+    # The index can only be used on the inner ORDER BY / LIMIT. That subquery
+    # is closed before the per-document window filters on doc_rank.
+    assert compact.index("ORDER BY embedding") < compact.index("raw_hits")
+    assert compact.index("LIMIT %s") < compact.index("raw_hits")
+    assert compact.index("raw_hits") < compact.index("doc_rank <=")
+    assert compact.lower().count("limit %s") == 2
+    exact_params = vector_search_params("[1]", filters, 4, 80)
+    assert len(exact_params) == vector_search_sql(where).count("%s")
+    assert exact_params[0] == "[1]"
+    assert exact_params[-1] == 80
+
+
+def test_ann_candidate_limit_stays_above_the_diversified_pool(monkeypatch):
+    monkeypatch.delenv("ANN_CANDIDATES", raising=False)
+    assert ann_candidate_limit(120) == 1000
+    monkeypatch.setenv("ANN_CANDIDATES", "50")
+    assert ann_candidate_limit(120) == 120
+    monkeypatch.setenv("ANN_CANDIDATES", "nope")
+    assert ann_candidate_limit(80) == 1000
+    monkeypatch.setenv("ANN_CANDIDATES", "2500")
+    assert ann_candidate_limit(80) == 2500
+
+
+def test_ann_settings_keep_index_scans_and_cover_the_limit():
+    class Cur:
+        def __init__(self):
+            self.statements = []
+
+        def execute(self, sql, params=None):
+            self.statements.append(sql)
+
+    cur = Cur()
+    apply_vector_settings(cur, exact=False, ef_search=1500)
+    text = "\n".join(cur.statements)
+    assert "enable_indexscan = off" not in text
+    assert "enable_bitmapscan = off" not in text
+    assert "SET LOCAL hnsw.ef_search = 1500" in text
+    assert "SET LOCAL hnsw.iterative_scan = relaxed_order" in text
+    # The broad floor is applied first; the LIMIT-sized value is the one that sticks.
+    assert text.index("SET LOCAL hnsw.ef_search = 1000") < text.index(
+        "SET LOCAL hnsw.ef_search = 1500"
+    )
+
+
+def test_hnsw_index_sql_is_concurrent_idempotent_and_non_destructive():
+    statement = " ".join(HNSW_INDEX_SQL.split())
+    assert statement == (
+        "CREATE INDEX CONCURRENTLY IF NOT EXISTS knowledge_chunks_embedding_hnsw "
+        "ON knowledge_chunks USING hnsw (embedding vector_cosine_ops) "
+        "WITH (m = 16, ef_construction = 64)"
+    )
+    for sql in (HNSW_INDEX_SQL, HNSW_READY_SQL, HNSW_STATE_SQL):
+        lowered = sql.lower()
+        assert "knowledge_chunks" in lowered
+        for forbidden in ("drop ", "delete ", "truncate ", "alter table"):
+            assert forbidden not in lowered
+    assert "vector_cosine_ops" in HNSW_READY_SQL
+    assert "indisvalid" in HNSW_READY_SQL
+    assert "indclass[0]" in HNSW_READY_SQL
+    assert "indkey[0]" in HNSW_READY_SQL
+    assert "hnsw" in HNSW_READY_SQL.lower()

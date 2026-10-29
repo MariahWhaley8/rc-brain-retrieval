@@ -1,8 +1,11 @@
+import logging
 import threading
+import time
 from contextlib import contextmanager
 from datetime import datetime
 from zoneinfo import ZoneInfo
 
+import psycopg2
 import pytest
 from fastapi.testclient import TestClient
 
@@ -23,6 +26,12 @@ PASSAGE_KEYS = {
 }
 
 
+def _join_hnsw_threads():
+    for thread in threading.enumerate():
+        if thread.name == "hnsw-index" and thread is not threading.current_thread():
+            thread.join(2)
+
+
 @pytest.fixture(autouse=True)
 def reset_state():
     def clear():
@@ -39,10 +48,18 @@ def reset_state():
                 }
             )
 
+    def clear_runtime():
+        api.set_ann_index_ready(False)
+        api._ann_build_started = False
+        api._embed_cache.clear()
+
     clear()
+    clear_runtime()
     api._search_ready = True
     yield
+    _join_hnsw_threads()
     clear()
+    clear_runtime()
     api._search_ready = True
 
 
@@ -267,7 +284,16 @@ def test_retrieve_response_shape_is_unchanged(client, monkeypatch):
     )
     assert response.status_code == 200
     body = response.json()
-    assert set(body) == {"question", "passages"}
+    assert set(body) == {"question", "passages", "timings_ms"}
+    assert set(body["timings_ms"]) == {
+        "embed",
+        "keyword",
+        "vector_search",
+        "rerank",
+        "neighbors",
+        "total",
+    }
+    assert all(isinstance(value, int) and value >= 0 for value in body["timings_ms"].values())
     assert body["question"] == "How does PTO work?"
     assert len(body["passages"]) == 1
     passage = body["passages"][0]
@@ -287,7 +313,10 @@ def test_retrieve_response_shape_is_unchanged(client, monkeypatch):
     assert "document_id, title, category, topic, source, source_url, source_date, is_authoritative, chunk_text" in vector_sql
     assert "category = %s" in vector_sql
     assert "NOT ILIKE ALL" in vector_sql
+    assert "vector_exact" in vector_sql
+    assert "ORDER BY embedding" not in vector_sql
     assert "enable_indexscan = off" in " ".join(sqls)
+    assert api.ann_index_ready() is False
     assert any("RC Brain Agent Evaluation Q&A" in str(params) for params in db.params)
     assert db.rerank_inputs == ["Title: Employee handbook\n\nPTO accrues each pay period."]
     vector_params = next(
@@ -631,4 +660,395 @@ def test_health_shape(client, monkeypatch):
         "chunk_count": 8284,
         "doc_count": 1267,
         "embed_model": api.VOYAGE_EMBED_MODEL,
+        "vector_index": "pending",
     }
+    api.set_ann_index_ready(True)
+    ready = client.get("/health")
+    assert ready.status_code == 200
+    assert ready.json()["vector_index"] == "ready"
+    assert ready.json()["chunk_count"] == 8284
+
+
+def _vector_sql(statements):
+    return " ".join(next(sql for sql in statements if "embedding <=>" in sql).split())
+
+
+def test_ready_index_uses_hnsw_and_exact_search_forces_the_old_scan(client, monkeypatch):
+    handbook = _row("doc-1", "Employee handbook", "PTO accrues each pay period.", score=0.2)
+    db = RecordingDB(lambda kind: [handbook] if kind == "vector" else []).install(monkeypatch)
+    api.set_ann_index_ready(True)
+
+    fast = client.post(
+        "/retrieve",
+        headers=AUTH,
+        json={"question": "How does PTO work?"},
+    )
+    assert fast.status_code == 200
+    assert fast.json()["passages"][0]["chunk_text"] == "PTO accrues each pay period."
+    fast_sql = _vector_sql(db.statements)
+    assert "vector_ann" in fast_sql
+    assert fast_sql.count("embedding <=>") == 2
+    assert "ORDER BY embedding <=> %s::vector" in fast_sql
+    assert "enable_indexscan = off" not in " ".join(db.statements)
+    assert "SET LOCAL hnsw.ef_search = 1000" in " ".join(db.statements)
+    vector_params = next(
+        params
+        for sql, params in zip(db.statements, db.params)
+        if params and "embedding <=>" in sql
+    )
+    assert vector_params[-4] == vector_params[0]
+    assert vector_params[-3] == 1000
+    assert vector_params[-1] >= 80
+    assert db.rerank_inputs == ["Title: Employee handbook\n\nPTO accrues each pay period."]
+
+    db = RecordingDB(lambda kind: [handbook] if kind == "vector" else []).install(monkeypatch)
+    exact = client.post(
+        "/retrieve",
+        headers=AUTH,
+        json={"question": "How does PTO work?", "exact_search": True},
+    )
+    assert exact.status_code == 200
+    assert exact.json()["passages"][0]["document_id"] == "doc-1"
+    exact_sql = _vector_sql(db.statements)
+    assert "vector_exact" in exact_sql
+    assert "ORDER BY embedding <=>" not in exact_sql
+    assert exact_sql.count("embedding <=>") == 1
+    assert "enable_indexscan = off" in " ".join(db.statements)
+
+
+def test_vector_search_stays_exact_until_the_hnsw_index_is_ready(client, monkeypatch):
+    handbook = _row("doc-1", "Employee handbook", "PTO accrues each pay period.")
+    db = RecordingDB(lambda kind: [handbook] if kind == "vector" else []).install(monkeypatch)
+    api.set_ann_index_ready(False)
+    response = client.post(
+        "/retrieve",
+        headers=AUTH,
+        json={"question": "index is not ready yet", "exact_search": False},
+    )
+    assert response.status_code == 200
+    sql = _vector_sql(db.statements)
+    assert "vector_exact" in sql
+    assert "enable_indexscan = off" in " ".join(db.statements)
+
+
+def test_vector_exact_search_env_rolls_back_to_the_sequential_scan(client, monkeypatch):
+    handbook = _row("doc-1", "Employee handbook", "PTO accrues each pay period.")
+    db = RecordingDB(lambda kind: [handbook] if kind == "vector" else []).install(monkeypatch)
+    api.set_ann_index_ready(True)
+    monkeypatch.setenv("VECTOR_EXACT_SEARCH", "true")
+    response = client.post(
+        "/retrieve",
+        headers=AUTH,
+        json={"question": "rollback this request"},
+    )
+    assert response.status_code == 200
+    assert "vector_exact" in _vector_sql(db.statements)
+    assert "enable_indexscan = off" in " ".join(db.statements)
+
+
+def test_retrieve_logs_stage_timings(client, monkeypatch, caplog):
+    handbook = _row("doc-1", "Employee handbook", "PTO accrues each pay period.")
+    RecordingDB(lambda kind: [handbook] if kind == "vector" else []).install(monkeypatch)
+    with caplog.at_level(logging.INFO, logger="api"):
+        response = client.post(
+            "/retrieve",
+            headers=AUTH,
+            json={"question": "log the stages"},
+        )
+    assert response.status_code == 200
+    assert any(
+        "timings_ms" in record.message and "vector_search" in record.message
+        for record in caplog.records
+    )
+
+
+def test_repeated_question_reuses_the_query_embedding(client, monkeypatch):
+    calls = []
+
+    class Embed:
+        embeddings = [[0.1, 0.2, 0.3]]
+
+    def embed(texts, model=None, input_type=None):
+        calls.append(texts[0])
+        return Embed()
+
+    RecordingDB(
+        lambda kind: [_row("doc-1", "Employee handbook", "PTO accrues each pay period.")]
+        if kind == "vector"
+        else []
+    ).install(monkeypatch)
+    monkeypatch.setattr(api.vo, "embed", embed)
+    question = "How does PTO work?"
+    first = client.post("/retrieve", headers=AUTH, json={"question": question})
+    second = client.post("/retrieve", headers=AUTH, json={"question": question})
+    assert first.status_code == 200
+    assert second.status_code == 200
+    assert calls == [question]
+    other = client.post(
+        "/retrieve",
+        headers=AUTH,
+        json={"question": "A different question"},
+    )
+    assert other.status_code == 200
+    assert calls == [question, "A different question"]
+
+
+def test_failed_query_embedding_is_not_cached(client, monkeypatch):
+    calls = {"n": 0}
+
+    class Embed:
+        embeddings = [[0.1, 0.2, 0.3]]
+
+    def embed(texts, model=None, input_type=None):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise RuntimeError("voyage down")
+        return Embed()
+
+    RecordingDB(
+        lambda kind: [_row("doc-1", "Employee handbook", "PTO accrues each pay period.")]
+        if kind == "vector"
+        else []
+    ).install(monkeypatch)
+    monkeypatch.setattr(api.vo, "embed", embed)
+    question = "cache miss after an error"
+    failed = client.post("/retrieve", headers=AUTH, json={"question": question})
+    assert failed.status_code == 502
+    ok = client.post("/retrieve", headers=AUTH, json={"question": question})
+    assert ok.status_code == 200
+    assert calls["n"] == 2
+
+
+def test_embedding_cache_expires_and_evicts_the_least_recently_used():
+    cache = api.QueryEmbeddingCache(maxsize=2, ttl_seconds=0.05)
+    cache.put("a", (1,))
+    cache.put("b", (2,))
+    assert cache.get("a") == (1,)
+    cache.put("c", (3,))
+    assert cache.get("b") is None
+    assert cache.get("a") == (1,)
+    assert cache.get("c") == (3,)
+    time.sleep(0.06)
+    assert cache.get("a") is None
+    assert cache.get("c") is None
+
+    disabled = api.QueryEmbeddingCache(maxsize=4, ttl_seconds=0)
+    disabled.put("a", (1,))
+    assert disabled.get("a") is None
+
+
+def test_get_db_reuses_a_pooled_connection_and_rolls_it_back(monkeypatch):
+    class FakeConn:
+        def __init__(self):
+            self.closed = 0
+            self.rollbacks = 0
+
+        def rollback(self):
+            self.rollbacks += 1
+
+    conn = FakeConn()
+
+    class FakePool:
+        def __init__(self):
+            self.puts = []
+
+        def getconn(self):
+            return conn
+
+        def putconn(self, returned, close=False):
+            self.puts.append((returned, close))
+
+    pool = FakePool()
+    monkeypatch.setattr(api, "_pool", lambda: pool)
+    with api.get_db() as first:
+        assert first is conn
+    with api.get_db() as second:
+        assert second is conn
+    assert conn.rollbacks == 2
+    assert pool.puts == [(conn, False), (conn, False)]
+
+
+def test_get_db_discards_a_connection_that_cannot_be_reset(monkeypatch):
+    class FakeConn:
+        def __init__(self):
+            self.closed = 0
+
+        def rollback(self):
+            raise psycopg2.OperationalError("ssl eof")
+
+    conn = FakeConn()
+    puts = []
+
+    class FakePool:
+        def getconn(self):
+            return conn
+
+        def putconn(self, returned, close=False):
+            puts.append(close)
+
+    monkeypatch.setattr(api, "_pool", lambda: FakePool())
+    with pytest.raises(RuntimeError):
+        with api.get_db():
+            raise RuntimeError("query failed")
+    assert puts == [True]
+
+
+class _IndexConn:
+    def __init__(self, fetches):
+        self.autocommit = False
+        self.statements = []
+        self.fetches = list(fetches)
+        self.closed = False
+        self.fail_analyze = False
+
+    def cursor(self):
+        return self
+
+    def execute(self, sql, params=None):
+        assert self.autocommit is True
+        text = " ".join(sql.split())
+        self.statements.append(text)
+        if self.fail_analyze and text.startswith("ANALYZE"):
+            raise RuntimeError("analyze failed")
+        if getattr(self, "fail_create", False) and text.startswith("CREATE INDEX"):
+            raise RuntimeError("relation already exists")
+
+    def fetchone(self):
+        if not self.fetches:
+            return None
+        return self.fetches.pop(0)
+
+    def close(self):
+        self.closed = True
+
+
+def test_hnsw_build_creates_the_index_outside_a_transaction():
+    conn = _IndexConn([(False,), None, (True,)])
+    assert api.build_hnsw_index(connect=lambda: conn) is True
+    assert conn.closed is True
+    text = "\n".join(conn.statements)
+    assert "CREATE INDEX CONCURRENTLY IF NOT EXISTS knowledge_chunks_embedding_hnsw" in text
+    assert "USING hnsw (embedding vector_cosine_ops)" in text
+    assert "WITH (m = 16, ef_construction = 64)" in text
+    assert "ANALYZE knowledge_chunks" in text
+    lowered = text.lower()
+    for forbidden in ("drop ", "delete ", "truncate ", "alter table"):
+        assert forbidden not in lowered
+    assert "maintenance_work_mem" not in lowered
+
+
+def test_hnsw_build_skips_create_when_the_index_is_already_valid():
+    conn = _IndexConn([(True,)])
+    assert api.build_hnsw_index(connect=lambda: conn) is True
+    assert conn.closed is True
+    assert not any("CREATE INDEX" in sql for sql in conn.statements)
+
+
+def test_hnsw_build_does_not_drop_an_invalid_index():
+    conn = _IndexConn([(False,), (False, False), (False,)])
+    assert api.build_hnsw_index(connect=lambda: conn) is False
+    assert any("CREATE INDEX CONCURRENTLY" in sql for sql in conn.statements)
+    assert not any(sql.lower().startswith("drop") for sql in conn.statements)
+
+
+def test_hnsw_ready_check_falls_back_when_the_catalog_query_fails():
+    class Conn(_IndexConn):
+        def execute(self, sql, params=None):
+            assert self.autocommit is True
+            text = " ".join(sql.split())
+            if "vector_cosine_ops" in text and text.startswith("SELECT"):
+                self.statements.append(text)
+                raise RuntimeError("catalog query failed")
+            return super().execute(sql, params)
+
+    conn = Conn([(True, True)])
+    assert api.build_hnsw_index(connect=lambda: conn) is True
+    assert any("vector_cosine_ops" in sql for sql in conn.statements)
+    assert not any(sql.startswith("CREATE INDEX") for sql in conn.statements)
+
+
+def test_hnsw_build_accepts_an_index_created_by_another_session():
+    conn = _IndexConn([(False,), None, (True,)])
+    conn.fail_create = True
+    assert api.build_hnsw_index(connect=lambda: conn) is True
+    assert any(sql.startswith("CREATE INDEX") for sql in conn.statements)
+
+
+def test_hnsw_build_survives_analyze_failing():
+    conn = _IndexConn([(False,), None, (True,)])
+    conn.fail_analyze = True
+    assert api.build_hnsw_index(connect=lambda: conn) is True
+    assert any(sql.startswith("ANALYZE") for sql in conn.statements)
+
+
+def test_hnsw_maintenance_work_mem_rejects_anything_that_is_not_a_size(monkeypatch):
+    monkeypatch.setenv("HNSW_MAINTENANCE_WORK_MEM", "512MB; DROP TABLE knowledge_chunks")
+    conn = _IndexConn([(False,), None, (True,)])
+    assert api.build_hnsw_index(connect=lambda: conn) is True
+    assert not any("drop table" in sql.lower() for sql in conn.statements)
+    assert not any("maintenance_work_mem" in sql for sql in conn.statements)
+
+    monkeypatch.setenv("HNSW_MAINTENANCE_WORK_MEM", "512MB")
+    conn = _IndexConn([(False,), None, (True,)])
+    assert api.build_hnsw_index(connect=lambda: conn) is True
+    assert any(sql == "SET maintenance_work_mem = '512MB'" for sql in conn.statements)
+
+
+def test_hnsw_thread_failure_leaves_exact_search_in_place(monkeypatch):
+    def boom():
+        raise RuntimeError("disk full")
+
+    monkeypatch.setattr(api, "build_hnsw_index", boom)
+    api._ann_build_started = False
+    api.set_ann_index_ready(False)
+    thread = api.start_ann_index_build()
+    assert thread is not None
+    thread.join(2)
+    assert api.ann_index_ready() is False
+    assert api.start_ann_index_build() is None
+
+
+def test_hnsw_build_does_not_block_startup(monkeypatch):
+    started = threading.Event()
+    release = threading.Event()
+
+    def slow():
+        started.set()
+        assert release.wait(2)
+        return False
+
+    monkeypatch.setattr(api, "build_hnsw_index", slow)
+    api._ann_build_started = False
+    monkeypatch.setenv("ANN_INDEX_ON_START", "true")
+
+    class Cur:
+        def execute(self, sql, params=None):
+            self.sql = sql
+
+        def fetchone(self):
+            return (1,)
+
+    class Conn:
+        def cursor(self):
+            return Cur()
+
+        def close(self):
+            return None
+
+    @contextmanager
+    def fake_db():
+        yield Conn()
+
+    monkeypatch.setattr(api, "get_db", fake_db)
+    began = time.perf_counter()
+    try:
+        with TestClient(api.app) as local_client:
+            assert time.perf_counter() - began < 1.0
+            assert started.wait(1)
+            response = local_client.get("/health")
+            assert response.status_code == 200
+            assert response.json()["status"] == "ok"
+            assert response.json()["vector_index"] == "pending"
+    finally:
+        release.set()
+        _join_hnsw_threads()
